@@ -454,6 +454,8 @@ def _scrub_ucx_config():
             tls = "rc," + tls
         if dask.config.get("ucx.nvlink"):
             tls = tls + ",cuda_ipc"
+        if dask.config.get("ucx.sm"):
+            tls = tls + ",sm"
 
         options = {"TLS": tls, "SOCKADDR_TLS_PRIORITY": tls_priority}
 
