@@ -21,11 +21,28 @@ rmm = pytest.importorskip("rmm")
 async def test_ucx_config(cleanup):
 
     ucx = {
+        "nvlink": False,
+        "infiniband": False,
+        "rdmacm": False,
+        "net-devices": "",
+        "tcp": True,
+        "sm": True,
+        "cuda_copy": False,
+    }
+
+    with dask.config.set(ucx=ucx):
+        ucx_config = _scrub_ucx_config()
+        assert ucx_config.get("TLS") == "tcp,sockcm,sm"
+        assert ucx_config.get("SOCKADDR_TLS_PRIORITY") == "sockcm"
+        assert ucx_config.get("NET_DEVICES") is None
+
+    ucx = {
         "nvlink": True,
         "infiniband": True,
         "rdmacm": False,
         "net-devices": "",
         "tcp": True,
+        "sm": False,
         "cuda_copy": True,
     }
 
@@ -41,6 +58,7 @@ async def test_ucx_config(cleanup):
         "rdmacm": False,
         "net-devices": "mlx5_0:1",
         "tcp": True,
+        "sm": False,
         "cuda_copy": False,
     }
 
@@ -57,6 +75,7 @@ async def test_ucx_config(cleanup):
         "net-devices": "all",
         "MEMTYPE_CACHE": "y",
         "tcp": True,
+        "sm": False,
         "cuda_copy": True,
     }
 
