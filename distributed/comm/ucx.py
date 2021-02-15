@@ -40,7 +40,16 @@ ucx_create_listener = None
 
 
 def synchronize_stream(stream=0):
+    import os
     import numba.cuda
+
+    ptds_enabled = (
+        int(os.environ.get("CUPY_CUDA_PER_THREAD_DEFAULT_STREAM", "0")) != 0
+        or int(os.environ.get("RMM_PER_THREAD_DEFAULT_STREAM", "0")) != 0
+    )
+
+    if stream == 0 and ptds_enabled is True:
+        stream = 2
 
     ctx = numba.cuda.current_context()
     cu_stream = numba.cuda.driver.drvapi.cu_stream(stream)
