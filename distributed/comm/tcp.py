@@ -27,6 +27,7 @@ from .registry import Backend, backends
 from .addressing import parse_host_port, unparse_host_port
 from .core import Comm, Connector, Listener, CommClosedError, FatalCommClosedError
 from .utils import to_frames, from_frames, get_tcp_server_address, ensure_concrete_host
+from ..protocol.utils import pack_frames_prelude, unpack_frames
 
 
 logger = logging.getLogger(__name__)
@@ -185,21 +186,18 @@ class TCP(Comm):
     async def read(self, deserializers=None):
         stream = self.stream
         if stream is None:
-            raise CommClosedError
+            raise CommClosedError()
+
+        fmt = "Q"
+        fmt_size = struct.calcsize(fmt)
 
         try:
-            n_frames = await stream.read_bytes(8)
-            n_frames = struct.unpack("Q", n_frames)[0]
-            lengths = await stream.read_bytes(8 * n_frames)
-            lengths = struct.unpack("Q" * n_frames, lengths)
+            frames_nbytes = await stream.read_bytes(fmt_size)
+            (frames_nbytes,) = struct.unpack(fmt, frames_nbytes)
 
-            frames = []
-            for length in lengths:
-                frame = bytearray(length)
-                if length:
-                    n = await stream.read_into(frame)
-                    assert n == length, (n, length)
-                frames.append(frame)
+            frames = bytearray(frames_nbytes)
+            n = await stream.read_into(frames)
+            assert n == frames_nbytes, (n, frames_nbytes)
         except StreamClosedError as e:
             self.stream = None
             self._closed = True
@@ -214,6 +212,8 @@ class TCP(Comm):
             raise
         else:
             try:
+                frames = unpack_frames(frames)
+
                 msg = await from_frames(
                     frames,
                     deserialize=self.deserialize,
@@ -228,9 +228,8 @@ class TCP(Comm):
 
     async def write(self, msg, serializers=None, on_error="message"):
         stream = self.stream
-        bytes_since_last_yield = 0
         if stream is None:
-            raise CommClosedError
+            raise CommClosedError()
 
         frames = await to_frames(
             msg,
@@ -243,45 +242,50 @@ class TCP(Comm):
                 **self.handshake_options,
             },
         )
+        frames_nbytes = sum(map(nbytes, frames))
+
+        header = pack_frames_prelude(frames)
+        header = struct.pack("Q", nbytes(header) + frames_nbytes) + header
+
+        frames = [header, *frames]
+        frames_nbytes += nbytes(header)
+
+        if frames_nbytes < 2 ** 17:  # 128kiB
+            # small enough, send in one go
+            frames = [b"".join(frames)]
 
         try:
-            nframes = len(frames)
-            lengths = [nbytes(frame) for frame in frames]
-            length_bytes = struct.pack(f"Q{nframes}Q", nframes, *lengths)
+            # trick to enque all frames for writing beforehand
+            for each_frame in frames:
+                each_frame_nbytes = nbytes(each_frame)
+                if each_frame_nbytes:
+                    if stream._write_buffer is None:
+                        raise StreamClosedError()
 
-            frames = [length_bytes, *frames]
-            lengths = [len(length_bytes), *lengths]
+                    if isinstance(each_frame, memoryview):
+                        # Make sure that len(data) == data.nbytes`
+                        # See <https://github.com/tornadoweb/tornado/pull/2996>
+                        each_frame = memoryview(each_frame).cast("B")
 
-            if sum(lengths) < 2 ** 17:  # 128kiB
-                # small enough, send in one go
-                stream.write(b"".join(frames))
-            else:
-                # avoid large memcpy, send in many
-                for frame, frame_bytes in zip(frames, lengths):
-                    # Can't wait for the write() Future as it may be lost
-                    # ("If write is called again before that Future has resolved,
-                    #   the previous future will be orphaned and will never resolve")
-                    future = stream.write(frame)
-                    bytes_since_last_yield += frame_bytes
-                    if bytes_since_last_yield > 32e6:
-                        await future
-                        bytes_since_last_yield = 0
+                    stream._write_buffer.append(each_frame)
+                    stream._total_write_index += each_frame_nbytes
+
+            # start writing frames
+            stream.write(b"")
         except StreamClosedError as e:
             self.stream = None
             self._closed = True
             if not shutting_down():
                 convert_stream_closed_error(self, e)
         except Exception:
-            # Some OSError or a another "low-level" exception. We do not really know what
-            # was already written to the underlying socket, so it is not even safe to retry
-            # here using the same stream. The only safe thing to do is to abort.
-            # (See also GitHub #4133).
-            if stream._write_buffer is None:
-                logger.info("tried to write message %s on closed stream", msg)
+            # Some OSError or a another "low-level" exception. We do not really know
+            # what was already written to the underlying socket, so it is not even safe
+            # to retry here using the same stream. The only safe thing to do is to
+            # abort. (See also GitHub #4133).
             self.abort()
             raise
 
-        return sum(lengths)
+        return frames_nbytes
 
     @gen.coroutine
     def close(self):

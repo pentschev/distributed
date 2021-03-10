@@ -55,7 +55,7 @@ from distributed.client import (
     temp_default_client,
     get_task_metadata,
 )
-from distributed.compatibility import WINDOWS
+from distributed.compatibility import MACOS, WINDOWS
 
 from distributed.metrics import time
 from distributed.scheduler import Scheduler, KilledWorker, CollectTaskMetaDataPlugin
@@ -3665,9 +3665,9 @@ async def test_reconnect_timeout(c, s):
     assert "Failed to reconnect" in text
 
 
+@pytest.mark.avoid_ci(reason="hangs on github actions ubuntu-latest CI")
 @pytest.mark.slow
 @pytest.mark.skipif(WINDOWS, reason="num_fds not supported on windows")
-@pytest.mark.skipif(sys.version_info < (3, 7), reason="TODO: intermittent failures")
 @pytest.mark.parametrize("worker,count,repeat", [(Worker, 100, 5), (Nanny, 10, 20)])
 def test_open_close_many_workers(loop, worker, count, repeat):
     psutil = pytest.importorskip("psutil")
@@ -4053,10 +4053,6 @@ def test_as_current_is_thread_local(s):
     t2.join()
 
 
-@pytest.mark.xfail(
-    sys.version_info < (3, 7),
-    reason="Python 3.6 contextvars are not copied on Task creation",
-)
 @gen_cluster(client=False)
 async def test_as_current_is_task_local(s, a, b):
     l1 = asyncio.Lock()
@@ -4486,6 +4482,7 @@ async def test_scatter_dict_workers(c, s, a, b):
     assert "a" in a.data or "a" in b.data
 
 
+@pytest.mark.flaky(reruns=10, reruns_delay=5, condition=MACOS)
 @pytest.mark.slow
 @gen_test()
 async def test_client_timeout():
@@ -4965,6 +4962,7 @@ async def test_secede_simple(c, s, a):
     assert result == 2
 
 
+@pytest.mark.flaky(reruns=10, reruns_delay=5)
 @pytest.mark.slow
 @gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 2, timeout=60)
 async def test_secede_balances(c, s, a, b):
@@ -4983,6 +4981,7 @@ async def test_secede_balances(c, s, a, b):
     while not all(f.status == "finished" for f in futures):
         await asyncio.sleep(0.01)
         assert threading.active_count() < count + 50
+        assert time() < start + 60
 
     assert len(a.log) < 2 * len(b.log)
     assert len(b.log) < 2 * len(a.log)
@@ -6475,6 +6474,27 @@ async def test_annotations_resources(c, s, a, b):
 
     assert all([{"GPU": 1} == ts.resource_restrictions for ts in s.tasks.values()])
     assert all([{"resources": {"GPU": 1}} == ts.annotations for ts in s.tasks.values()])
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[
+        ("127.0.0.1", 1),
+        ("127.0.0.1", 1, {"resources": {"GPU": 1}}),
+    ],
+)
+async def test_annotations_resources_culled(c, s, a, b):
+    da = pytest.importorskip("dask.array")
+
+    x = da.ones((2, 2, 2), chunks=1)
+    with dask.annotate(resources={"GPU": 1}):
+        y = x.map_blocks(lambda x0: x0, meta=x._meta)
+
+    z = y[0, 0, 0]
+
+    (z,) = c.compute([z], optimize_graph=False)
+    await z
+    # it worked!
 
 
 @gen_cluster(client=True)

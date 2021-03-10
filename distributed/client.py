@@ -61,7 +61,6 @@ from .core import (
 from .metrics import time
 from .protocol import to_serialize
 from .protocol.pickle import dumps, loads
-from .protocol.highlevelgraph import highlevelgraph_pack
 from .publish import Datasets
 from .pubsub import PubSubClientExtension
 from .security import Security
@@ -757,15 +756,6 @@ class Client:
         method to return self. Any Future objects deserialized inside this context
         manager will be automatically attached to this Client.
         """
-        # In Python 3.6, contextvars are thread-local but not Task-local.
-        # We can still detect a race condition though.
-        if sys.version_info < (3, 7) and _current_client.get() not in (self, None):
-            raise RuntimeError(
-                "Detected race condition where multiple asynchronous clients tried "
-                "entering the as_current() context manager at the same time. "
-                "Please upgrade to Python 3.7+."
-            )
-
         tok = _current_client.set(self)
         try:
             yield
@@ -809,6 +799,23 @@ class Client:
 
     @property
     def dashboard_link(self):
+        """Link to the scheduler's dashboard.
+
+        Returns
+        -------
+        str
+            Dashboard URL.
+
+        Examples
+        --------
+        Opening the dashboard in your default web browser:
+
+        >>> import webbrowser
+        >>> from distributed import Client
+        >>> client = Client()
+        >>> webbrowser.open(client.dashboard_link)
+
+        """
         try:
             return self.cluster.dashboard_link
         except AttributeError:
@@ -2540,7 +2547,7 @@ class Client:
             if not isinstance(dsk, HighLevelGraph):
                 dsk = HighLevelGraph.from_collections(id(dsk), dsk, dependencies=())
 
-            dsk = highlevelgraph_pack(dsk, self, keyset)
+            dsk = dsk.__dask_distributed_pack__(self, keyset)
 
             annotations = {}
             if user_priority:
@@ -3663,6 +3670,7 @@ class Client:
         return futures_of(futures, client=self)
 
     def start_ipython(self, *args, **kwargs):
+        """Deprecated - Method moved to start_ipython_workers"""
         raise Exception("Method moved to start_ipython_workers")
 
     async def _start_ipython_workers(self, workers):
@@ -3827,6 +3835,7 @@ class Client:
 
     @staticmethod
     def collections_to_dsk(collections, *args, **kwargs):
+        """Convert many collections into a single dask graph, after optimization"""
         return collections_to_dsk(collections, *args, **kwargs)
 
     def get_task_stream(
