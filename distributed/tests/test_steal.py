@@ -7,8 +7,11 @@ import weakref
 from operator import mul
 from time import sleep
 
-import dask
 import pytest
+from tlz import concat, sliding_window
+
+import dask
+
 from distributed import Nanny, Worker, wait, worker_client
 from distributed.config import config
 from distributed.metrics import time
@@ -24,7 +27,6 @@ from distributed.utils_test import (
     slowidentity,
     slowinc,
 )
-from tlz import concat, sliding_window
 
 # Most tests here are timing-dependent
 setup_module = nodebug_setup_module
@@ -659,6 +661,9 @@ async def test_steal_twice(c, s, a, b):
             % (len(empty_workers), len(has_what))
         )
     assert max(map(len, has_what.values())) < 30
+
+    assert a.in_flight_tasks == 0
+    assert b.in_flight_tasks == 0
 
     await c._close()
     await asyncio.gather(*[w.close() for w in workers])

@@ -2,33 +2,33 @@ import errno
 import functools
 import logging
 import socket
-from ssl import SSLError
 import struct
 import sys
-from tornado import gen
 import weakref
+from ssl import SSLError
+
+from tornado import gen
 
 try:
     import ssl
 except ImportError:
     ssl = None
 
-import dask
 from tornado import netutil
 from tornado.iostream import StreamClosedError
 from tornado.tcpclient import TCPClient
 from tornado.tcpserver import TCPServer
 
+import dask
+
+from ..protocol.utils import pack_frames_prelude, unpack_frames
 from ..system import MEMORY_LIMIT
 from ..threadpoolexecutor import ThreadPoolExecutor
-from ..utils import ensure_ip, get_ip, get_ipv6, nbytes, parse_timedelta, shutting_down
-
-from .registry import Backend, backends
+from ..utils import ensure_ip, get_ip, get_ipv6, nbytes, parse_timedelta
 from .addressing import parse_host_port, unparse_host_port
-from .core import Comm, Connector, Listener, CommClosedError, FatalCommClosedError
-from .utils import to_frames, from_frames, get_tcp_server_address, ensure_concrete_host
-from ..protocol.utils import pack_frames_prelude, unpack_frames
-
+from .core import Comm, CommClosedError, Connector, FatalCommClosedError, Listener
+from .registry import Backend, backends
+from .utils import ensure_concrete_host, from_frames, get_tcp_server_address, to_frames
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +169,9 @@ class TCP(Comm):
 
     def _get_finalizer(self):
         def finalize(stream=self.stream, r=repr(self)):
-            if not stream.closed():
-                logger.warning("Closing dangling stream in %s" % (r,))
+            # stream is None if a StreamClosedError is raised during interpreter shutdown
+            if stream is not None and not stream.closed():
+                logger.warning(f"Closing dangling stream in {r}")
                 stream.close()
 
         return finalize
@@ -201,7 +202,7 @@ class TCP(Comm):
         except StreamClosedError as e:
             self.stream = None
             self._closed = True
-            if not shutting_down():
+            if not sys.is_finalizing():
                 convert_stream_closed_error(self, e)
         except Exception:
             # Some OSError or a another "low-level" exception. We do not really know what
@@ -242,28 +243,30 @@ class TCP(Comm):
                 **self.handshake_options,
             },
         )
-        frames_nbytes = sum(map(nbytes, frames))
+        frames_nbytes = [nbytes(f) for f in frames]
+        frames_nbytes_total = sum(frames_nbytes)
 
         header = pack_frames_prelude(frames)
-        header = struct.pack("Q", nbytes(header) + frames_nbytes) + header
+        header = struct.pack("Q", nbytes(header) + frames_nbytes_total) + header
 
         frames = [header, *frames]
-        frames_nbytes += nbytes(header)
+        frames_nbytes = [nbytes(header), *frames_nbytes]
+        frames_nbytes_total += frames_nbytes[0]
 
-        if frames_nbytes < 2 ** 17:  # 128kiB
+        if frames_nbytes_total < 2 ** 17:  # 128kiB
             # small enough, send in one go
             frames = [b"".join(frames)]
+            frames_nbytes = [frames_nbytes_total]
 
         try:
             # trick to enque all frames for writing beforehand
-            for each_frame in frames:
-                each_frame_nbytes = nbytes(each_frame)
+            for each_frame_nbytes, each_frame in zip(frames_nbytes, frames):
                 if each_frame_nbytes:
                     if stream._write_buffer is None:
                         raise StreamClosedError()
 
                     if isinstance(each_frame, memoryview):
-                        # Make sure that len(data) == data.nbytes`
+                        # Make sure that `len(data) == data.nbytes`
                         # See <https://github.com/tornadoweb/tornado/pull/2996>
                         each_frame = memoryview(each_frame).cast("B")
 
@@ -275,7 +278,7 @@ class TCP(Comm):
         except StreamClosedError as e:
             self.stream = None
             self._closed = True
-            if not shutting_down():
+            if not sys.is_finalizing():
                 convert_stream_closed_error(self, e)
         except Exception:
             # Some OSError or a another "low-level" exception. We do not really know
@@ -285,7 +288,7 @@ class TCP(Comm):
             self.abort()
             raise
 
-        return frames_nbytes
+        return frames_nbytes_total
 
     @gen.coroutine
     def close(self):
