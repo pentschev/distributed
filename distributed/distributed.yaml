@@ -188,4 +188,4 @@ ucx:
   rdmacm: null # enable RDMACM
   cuda_copy: null  # enable cuda-copy
   net-devices: null  # define which Infiniband device to use
-  reuse-endpoints: True  # enable endpoint reuse
+  reuse-endpoints: False  # enable endpoint reuse
