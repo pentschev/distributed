@@ -125,6 +125,9 @@ def init_once():
             ucx_create_endpoint = ucp.create_endpoint
             ucx_create_listener = ucp.create_listener
 
+    ucp.register_am_allocator(host_array, "host")
+    ucp.register_am_allocator(device_array, "cuda")
+
 
 class UCX(Comm):
     """Comm object using UCP.
@@ -215,10 +218,10 @@ class UCX(Comm):
                 # Send meta data
 
                 # Send close flag and number of frames (_Bool, int64)
-                await self.ep.send(struct.pack("?Q", False, nframes))
+                await self.ep.am_send(struct.pack("?Q", False, nframes))
                 # Send which frames are CUDA (bool) and
                 # how large each frame is (uint64)
-                await self.ep.send(
+                await self.ep.am_send(
                     struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
                 )
 
@@ -233,7 +236,7 @@ class UCX(Comm):
                     synchronize_stream(0)
 
                 for each_frame in send_frames:
-                    await self.ep.send(each_frame)
+                    await self.ep.am_send(each_frame)
                 return sum(sizes)
             except (ucp.exceptions.UCXBaseException):
                 self.abort()
@@ -251,8 +254,7 @@ class UCX(Comm):
                 # Recv meta data
 
                 # Recv close flag and number of frames (_Bool, int64)
-                msg = host_array(struct.calcsize("?Q"))
-                await self.ep.recv(msg)
+                msg = await self.ep.am_recv()
                 (shutdown, nframes) = struct.unpack("?Q", msg)
 
                 if shutdown:  # The writer is closing the connection
@@ -261,34 +263,21 @@ class UCX(Comm):
                 # Recv which frames are CUDA (bool) and
                 # how large each frame is (uint64)
                 header_fmt = nframes * "?" + nframes * "Q"
-                header = host_array(struct.calcsize(header_fmt))
-                await self.ep.recv(header)
+                header = await self.ep.am_recv()
                 header = struct.unpack(header_fmt, header)
                 cuda_frames, sizes = header[:nframes], header[nframes:]
             except (ucp.exceptions.UCXBaseException, CancelledError):
                 self.abort()
                 raise CommClosedError("While reading, the connection was closed")
             else:
-                # Recv frames
-                frames = [
-                    device_array(each_size) if is_cuda else host_array(each_size)
-                    for is_cuda, each_size in zip(cuda_frames, sizes)
-                ]
-                cuda_recv_frames, recv_frames = zip(
-                    *(
-                        (is_cuda, each_frame)
-                        for is_cuda, each_frame in zip(cuda_frames, frames)
-                        if nbytes(each_frame) > 0
-                    )
-                )
-
                 # It is necessary to first populate `frames` with CUDA arrays and synchronize
                 # the default stream before starting receiving to ensure buffers have been allocated
-                if any(cuda_recv_frames):
+                if any(cuda_frames):
                     synchronize_stream(0)
 
-                for each_frame in recv_frames:
-                    await self.ep.recv(each_frame)
+                frames = []
+                for _ in range(nframes):
+                    frames.append(await self.ep.am_recv())
                 msg = await from_frames(
                     frames,
                     deserialize=self.deserialize,
@@ -300,8 +289,8 @@ class UCX(Comm):
     async def close(self):
         if self._ep is not None:
             try:
-                await self.ep.send(struct.pack("?Q", True, 0))
-            except ucp.exceptions.UCXError:
+                await self.ep.am_send(struct.pack("?Q", True, 0))
+            except (ucp.exceptions.UCXError, ucp.exceptions.UCXCloseError):
                 # If the other end is in the process of closing,
                 # UCX will sometimes raise a `Input/output` error,
                 # which we can ignore.
