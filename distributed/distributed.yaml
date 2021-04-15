@@ -197,3 +197,4 @@ ucx:
   rdmacm: False # enable RDMACM
   net-devices: null  # define what interface to use for UCX comm
   reuse-endpoints: True  # enable endpoint reuse
+  am: False  # use UCX AM (Active Messages) API instead of TAG

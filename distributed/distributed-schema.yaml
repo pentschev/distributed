@@ -856,5 +856,9 @@ properties:
           ``"auto"`` if any interfaces are disconnected or improperly configured.
       reuse-endpoints:
         type: boolean
-        description: | 
+        description: |
           Whether to reuse endpoints or not.
+      am:
+        type: boolean
+        description: |
+          When True, use the UCX AM (Active Messages) API instead of TAG.
