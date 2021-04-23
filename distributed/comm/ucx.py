@@ -60,7 +60,7 @@ def init_once():
         import numba.cuda
         numba.cuda.current_context()
 
-    use_am = dask.config.get("ucx.am")
+    use_am = dask.config.get("ucx.am", default=False)
 
     import ucp as _ucp
 
