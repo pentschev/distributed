@@ -13,7 +13,7 @@ except ImportError:
 
 from dask.utils_test import inc
 
-from distributed import wait
+from distributed import Nanny, wait
 from distributed.comm.utils import from_frames, to_frames
 from distributed.protocol import (
     Serialize,
@@ -143,6 +143,23 @@ def test_nested_deserialize():
         "y": {"a": ["abc", "def"], "b": b"ghi"},
     }
     assert x == x_orig  # x wasn't mutated
+
+
+def test_serialize_iterate_collection():
+    # Use iterate_collection to ensure elements of
+    # a collection will be serialized seperately
+
+    arr = "special-data"
+    sarr = Serialized(*serialize(arr))
+    sdarr = to_serialize(arr)
+
+    task1 = (0, sarr, "('fake-key', 3)", None)
+    task2 = (0, sdarr, "('fake-key', 3)", None)
+    expect = (0, arr, "('fake-key', 3)", None)
+
+    # Check serialize/deserialize directly
+    assert deserialize(*serialize(task1, iterate_collection=True)) == expect
+    assert deserialize(*serialize(task2, iterate_collection=True)) == expect
 
 
 from dask import delayed
@@ -499,3 +516,17 @@ def test_ser_memoryview_object():
     data_in = memoryview(np.array(["hello"], dtype=object))
     with pytest.raises(TypeError):
         serialize(data_in, on_error="raise")
+
+
+@gen_cluster(client=True, Worker=Nanny)
+async def test_large_pickled_object(c, s, a, b):
+    np = pytest.importorskip("numpy")
+
+    class Data:
+        def __init__(self, n):
+            self.data = np.empty(n, dtype="u1")
+
+    x = Data(100_000_000)
+    y = await c.scatter(x, workers=[a.worker_address])
+    z = c.submit(lambda x: x, y, workers=[b.worker_address])
+    await z
