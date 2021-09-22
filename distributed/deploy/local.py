@@ -7,11 +7,11 @@ import weakref
 import toolz
 
 from dask.system import CPU_COUNT
+from dask.widgets import get_template
 
 from ..nanny import Nanny
 from ..scheduler import Scheduler
 from ..security import Security
-from ..widgets import get_template
 from ..worker import Worker, parse_memory_limit
 from .spec import SpecCluster
 from .utils import nprocesses_nthreads
@@ -121,6 +121,7 @@ class LocalCluster(SpecCluster):
         interface=None,
         worker_class=None,
         scheduler_kwargs=None,
+        scheduler_sync_interval=1,
         **worker_kwargs,
     ):
         if ip is not None:
@@ -241,6 +242,7 @@ class LocalCluster(SpecCluster):
             asynchronous=asynchronous,
             silence_logs=silence_logs,
             security=security,
+            scheduler_sync_interval=scheduler_sync_interval,
         )
 
     def start_worker(self, *args, **kwargs):
