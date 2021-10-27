@@ -26,11 +26,13 @@ def init_once():
     nvmlOwnerPID = os.getpid()
     try:
         pynvml.nvmlInit()
+        print("nvmlInit passed")
     except (
         pynvml.NVMLError_LibraryNotFound,
         pynvml.NVMLError_DriverNotLoaded,
         pynvml.NVMLError_Unknown,
-    ):
+    ) as e:
+        print(f"nvmlInit error: {e}")
         nvmlLibraryNotFound = True
 
 
@@ -44,6 +46,7 @@ def device_get_count():
 
 def _pynvml_handles():
     count = device_get_count()
+    print(f"_pynvml_handles count: {count}")
     if count == 0:
         if nvmlLibraryNotFound:
             raise RuntimeError("PyNVML is installed, but NVML is not")
@@ -59,6 +62,7 @@ def _pynvml_handles():
         cuda_visible_devices = False
     if not cuda_visible_devices:
         cuda_visible_devices = list(range(count))
+    print(f"_pynvml_handles cuda_visible_devices: {cuda_visible_devices}")
     gpu_idx = cuda_visible_devices[0]
     return pynvml.nvmlDeviceGetHandleByIndex(gpu_idx)
 
