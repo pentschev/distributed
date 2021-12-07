@@ -306,7 +306,9 @@ class UCX(Comm):
 
     async def read(self, deserializers=("cuda", "dask", "pickle", "error")):
         with log_errors():
-            if self.closed():
+            # We don't check whether the endpoint has closed in newer UCX versions,
+            # error handling will take care of it when attempting to receive meta data.
+            if ucp.get_ucx_version() < (1, 11, 0) and self.closed():
                 raise CommClosedError("Endpoint is closed -- unable to read message")
 
             if deserializers is None:
