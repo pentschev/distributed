@@ -11,6 +11,7 @@ import os
 import struct
 import warnings
 import weakref
+from threading import Lock
 from typing import TYPE_CHECKING
 
 import dask
@@ -43,6 +44,10 @@ else:
 
 host_array = None
 device_array = None
+blocking_send = None
+blocking_recv = None
+non_blocking_send = None
+non_blocking_recv = None
 pre_existing_cuda_context = False
 cuda_context_created = False
 
@@ -168,6 +173,16 @@ def init_once():
             ucx_create_endpoint = EndpointReuse.create_endpoint
             ucx_create_listener = EndpointReuse.create_listener
 
+    from ucp._libs.utils_test import blocking_recv as _blocking_recv
+    from ucp._libs.utils_test import blocking_send as _blocking_send
+    from ucp._libs.utils_test import non_blocking_recv as _non_blocking_recv
+    from ucp._libs.utils_test import non_blocking_send as _non_blocking_send
+
+    global blocking_send, blocking_recv
+    global non_blocking_send, non_blocking_recv
+    blocking_send, blocking_recv = _blocking_send, _blocking_recv
+    non_blocking_send, non_blocking_recv = _non_blocking_send, _non_blocking_recv
+
 
 def _close_comm(ref):
     """Callback to close Dask Comm when UCX Endpoint closes or errors
@@ -280,13 +295,32 @@ class UCX(Comm):
 
                 # Send meta data
 
-                # Send close flag and number of frames (_Bool, int64)
-                await self.ep.send(struct.pack("?Q", False, nframes))
-                # Send which frames are CUDA (bool) and
-                # how large each frame is (uint64)
-                await self.ep.send(
+                # # Send close flag and number of frames (_Bool, int64)
+                # await self.ep.send(struct.pack("?Q", False, nframes))
+                await self.ep.sync_send(struct.pack("?Q", False, nframes))
+                # blocking_send(
+                #     self.ep._ep.worker,
+                #     self.ep._ep,
+                #     struct.pack("?Q", False, nframes),
+                #     tag=self.ep._tags["msg_send"],
+                # )
+                # print(f"[{os.getpid()}] Writing {nframes} frames on tag {hex(self.ep._tags['msg_send'])}")
+
+                # # Send which frames are CUDA (bool) and
+                # # how large each frame is (uint64)
+                # await self.ep.send(
+                #     struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
+                # )
+                await self.ep.sync_send(
                     struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
                 )
+                # blocking_send(
+                #     self.ep._ep.worker,
+                #     self.ep._ep,
+                #     struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes),
+                #     tag=self.ep._tags["msg_send"],
+                # )
+                # print(f"[{os.getpid()}] Writing {sizes} sizes on tag {hex(self.ep._tags['msg_send'])}")
 
                 # Send frames
 
@@ -299,7 +333,16 @@ class UCX(Comm):
                     synchronize_stream(0)
 
                 for each_frame in send_frames:
-                    await self.ep.send(each_frame)
+                    # await self.ep.send(each_frame)
+                    await self.ep.sync_send(each_frame)
+                    # blocking_send(
+                    #     self.ep._ep.worker,
+                    #     self.ep._ep,
+                    #     each_frame,
+                    #     tag=self.ep._tags["msg_send"],
+                    # )
+                    # print(f"[{os.getpid()}] Writing frame {each_frame} on tag {hex(self.ep._tags['msg_send'])}")
+                # print(f"[{os.getpid()}] {sum(sizes)} bytes written")
                 return sum(sizes)
             except (ucp.exceptions.UCXBaseException):
                 self.abort()
@@ -316,10 +359,50 @@ class UCX(Comm):
             try:
                 # Recv meta data
 
+                finished = [0]
+                op_lock = Lock()
+
+                def op_started():
+                    pass
+
+                def op_completed():
+                    with op_lock:
+                        finished[0] += 1
+
+                # non_blocking_send(
+                #     ep._ep.worker,
+                #     ep._ep,
+                #     msg_recv_list[i],
+                #     op_started,
+                #     op_completed,
+                #     tag=ep._tags["msg_send"]
+                # )
+
                 # Recv close flag and number of frames (_Bool, int64)
                 msg = host_array(struct.calcsize("?Q"))
-                await self.ep.recv(msg)
+                # await self.ep.recv(msg)
+                await self.ep.sync_recv(msg)
+                # blocking_recv(
+                #     self.ep._ep.worker,
+                #     self.ep._ep,
+                #     msg,
+                #     tag=self.ep._tags["msg_recv"],
+                # )
+                # print(f"[{os.getpid()}] Read on tag {hex(self.ep._tags['msg_recv'])}")
+                # non_blocking_recv(
+                #     self.ep._ep.worker,
+                #     self.ep._ep,
+                #     msg,
+                #     op_started,
+                #     op_completed,
+                #     tag=self.ep._tags["msg_recv"]
+                # )
+                # while finished[0] < 1:
+                #     self.ep._ep.worker.progress()
+                #     await asyncio.sleep(0)
                 (shutdown, nframes) = struct.unpack("?Q", msg)
+                # print(f"[{os.getpid()}] Finished1: {finished[0]} on tag {hex(self.ep._tags['msg_recv'])}")
+                # print(f"[{os.getpid()}] Reading {nframes} frames on tag {hex(self.ep._tags['msg_recv'])}")
 
                 if shutdown:  # The writer is closing the connection
                     raise CommClosedError("Connection closed by writer")
@@ -328,9 +411,29 @@ class UCX(Comm):
                 # how large each frame is (uint64)
                 header_fmt = nframes * "?" + nframes * "Q"
                 header = host_array(struct.calcsize(header_fmt))
-                await self.ep.recv(header)
+                # await self.ep.recv(header)
+                await self.ep.sync_recv(header)
+                # blocking_recv(
+                #     self.ep._ep.worker,
+                #     self.ep._ep,
+                #     header,
+                #     tag=self.ep._tags["msg_recv"],
+                # )
+                # non_blocking_recv(
+                #     self.ep._ep.worker,
+                #     self.ep._ep,
+                #     header,
+                #     op_started,
+                #     op_completed,
+                #     tag=self.ep._tags["msg_recv"],
+                # )
+                # while finished[0] < 2:
+                #     self.ep._ep.worker.progress()
+                #     await asyncio.sleep(0)
+                # print(f"[{os.getpid()}] Finished2: {finished[0]} on tag {hex(self.ep._tags['msg_recv'])}")
                 header = struct.unpack(header_fmt, header)
                 cuda_frames, sizes = header[:nframes], header[nframes:]
+                # print(f"[{os.getpid()}] Reading {sizes} sizes on tag {hex(self.ep._tags['msg_recv'])}")
             except (
                 ucp.exceptions.UCXCloseError,
                 ucp.exceptions.UCXCanceled,
@@ -357,13 +460,36 @@ class UCX(Comm):
                     synchronize_stream(0)
 
                 for each_frame in recv_frames:
-                    await self.ep.recv(each_frame)
-                msg = await from_frames(
-                    frames,
-                    deserialize=self.deserialize,
-                    deserializers=deserializers,
-                    allow_offload=self.allow_offload,
-                )
+                    # await self.ep.recv(each_frame)
+                    await self.ep.sync_recv(each_frame)
+                    # blocking_recv(
+                    #     self.ep._ep.worker,
+                    #     self.ep._ep,
+                    #     each_frame,
+                    #     tag=self.ep._tags["msg_recv"],
+                    # )
+                    # non_blocking_recv(
+                    #     self.ep._ep.worker,
+                    #     self.ep._ep,
+                    #     each_frame,
+                    #     op_started,
+                    #     op_completed,
+                    #     tag=self.ep._tags["msg_recv"],
+                    # )
+                    # while finished[0] < 2 + nframes:
+                    #     self.ep._ep.worker.progress()
+                    #     await asyncio.sleep(0)
+                    # print(f"[{os.getpid()}] Finished3: {finished[0]} on tag {hex(self.ep._tags['msg_recv'])}")
+                try:
+                    msg = await from_frames(
+                        frames,
+                        deserialize=self.deserialize,
+                        deserializers=deserializers,
+                        allow_offload=self.allow_offload,
+                    )
+                except Exception as e:
+                    print(f"Exception: {frames}")
+                    raise e
                 return msg
 
     async def close(self):
