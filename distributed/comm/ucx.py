@@ -5,10 +5,10 @@ See :ref:`communications` for more.
 
 .. _UCX: https://github.com/openucx/ucx
 """
-import functools
 import logging
 import os
 import struct
+import threading
 import warnings
 import weakref
 from typing import TYPE_CHECKING
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # variables to be set before being imported.
 if TYPE_CHECKING:
     try:
-        import ucp
+        import ucxx as ucp
     except ImportError:
         pass
 else:
@@ -45,6 +45,8 @@ else:
 device_array = None
 pre_existing_cuda_context = False
 cuda_context_created = False
+# UseAsyncio = True
+UseMulti = True
 
 
 def synchronize_stream(stream=0):
@@ -93,6 +95,7 @@ def init_once():
                 "of a program."
             )
 
+        print(f"[{threading.get_native_id()}] Creating CUDA Context", flush=True)
         numba.cuda.current_context()
 
         cuda_context_created = has_cuda_context()
@@ -109,7 +112,8 @@ def init_once():
                 "the global scope of a program."
             )
 
-    import ucp as _ucp
+    # import ucp as _ucp
+    import ucxx as _ucp
 
     ucp = _ucp
 
@@ -143,18 +147,6 @@ def init_once():
         rmm.reinitialize(
             pool_allocator=True, managed_memory=False, initial_pool_size=pool_size
         )
-
-
-def _close_comm(ref):
-    """Callback to close Dask Comm when UCX Endpoint closes or errors
-
-    Parameters
-    ----------
-        ref: weak reference to a Dask UCX comm
-    """
-    comm = ref()
-    if comm is not None:
-        comm._closed = True
 
 
 class UCX(Comm):
@@ -194,22 +186,13 @@ class UCX(Comm):
     def __init__(self, ep, local_addr: str, peer_addr: str, deserialize: bool = True):
         super().__init__(deserialize=deserialize)
         self._ep = ep
+        self._ep_handle = int(self._ep._ep.handle)
         if local_addr:
             assert local_addr.startswith("ucx")
         assert peer_addr.startswith("ucx")
         self._local_addr = local_addr
         self._peer_addr = peer_addr
         self.comm_flag = None
-
-        # When the UCX endpoint closes or errors the registered callback
-        # is called.
-        if hasattr(self._ep, "set_close_callback"):
-            ref = weakref.ref(self)
-            self._ep.set_close_callback(functools.partial(_close_comm, ref))
-            self._closed = False
-            self._has_close_callback = True
-        else:
-            self._has_close_callback = False
 
         logger.debug("UCX.__init__ %s", self)
 
@@ -240,43 +223,48 @@ class UCX(Comm):
                     on_error=on_error,
                     allow_offload=self.allow_offload,
                 )
-                nframes = len(frames)
-                cuda_frames = tuple(
-                    hasattr(f, "__cuda_array_interface__") for f in frames
-                )
                 sizes = tuple(nbytes(f) for f in frames)
-                cuda_send_frames, send_frames = zip(
-                    *(
-                        (is_cuda, each_frame)
-                        for is_cuda, each_frame in zip(cuda_frames, frames)
-                        if nbytes(each_frame) > 0
+
+                if UseMulti is True:
+                    await self.ep.send_multi(frames)
+                else:
+                    nframes = len(frames)
+                    cuda_frames = tuple(
+                        hasattr(f, "__cuda_array_interface__") for f in frames
                     )
-                )
+                    cuda_send_frames, send_frames = zip(
+                        *(
+                            (is_cuda, each_frame)
+                            for is_cuda, each_frame in zip(cuda_frames, frames)
+                            if nbytes(each_frame) > 0
+                        )
+                    )
+                    # print(f"send_frames {type(send_frames)}: {len(send_frames)}")
 
-                # Send meta data
+                    # Send meta data
 
-                # Send close flag and number of frames (_Bool, int64)
-                await self.ep.send(struct.pack("?Q", False, nframes))
-                # Send which frames are CUDA (bool) and
-                # how large each frame is (uint64)
-                await self.ep.send(
-                    struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
-                )
+                    # Send close flag and number of frames (_Bool, int64)
+                    await self.ep.send(struct.pack("?Q", False, nframes))
+                    # Send which frames are CUDA (bool) and
+                    # how large each frame is (uint64)
+                    await self.ep.send(
+                        struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
+                    )
 
-                # Send frames
+                    # Send frames
 
-                # It is necessary to first synchronize the default stream before start
-                # sending We synchronize the default stream because UCX is not
-                # stream-ordered and syncing the default stream will wait for other
-                # non-blocking CUDA streams. Note this is only sufficient if the memory
-                # being sent is not currently in use on non-blocking CUDA streams.
-                if any(cuda_send_frames):
-                    synchronize_stream(0)
+                    # It is necessary to first synchronize the default stream before start
+                    # sending We synchronize the default stream because UCX is not
+                    # stream-ordered and syncing the default stream will wait for other
+                    # non-blocking CUDA streams. Note this is only sufficient if the memory
+                    # being sent is not currently in use on non-blocking CUDA streams.
+                    if any(cuda_send_frames):
+                        synchronize_stream(0)
 
-                for each_frame in send_frames:
-                    await self.ep.send(each_frame)
+                    for each_frame in send_frames:
+                        await self.ep.send(each_frame)
                 return sum(sizes)
-            except (ucp.exceptions.UCXBaseException):
+            except (ucp.UCXBaseException):
                 self.abort()
                 raise CommClosedError("While writing, the connection was closed")
 
@@ -285,51 +273,85 @@ class UCX(Comm):
             if deserializers is None:
                 deserializers = ("cuda", "dask", "pickle", "error")
 
-            try:
-                # Recv meta data
-
-                # Recv close flag and number of frames (_Bool, int64)
-                msg = host_array(struct.calcsize("?Q"))
-                await self.ep.recv(msg)
-                (shutdown, nframes) = struct.unpack("?Q", msg)
-
-                if shutdown:  # The writer is closing the connection
+            if UseMulti is True:
+                try:
+                    frames = await self.ep.recv_multi()
+                except (
+                    ucp.UCXCloseError,
+                    ucp.UCXCanceled,
+                    # ) + (getattr(ucp, "UCXConnectionReset", ()),):
+                ) + (
+                    getattr(ucp, "UCXConnectionResetError", ()),
+                ):
+                    self.abort()
                     raise CommClosedError("Connection closed by writer")
-
-                # Recv which frames are CUDA (bool) and
-                # how large each frame is (uint64)
-                header_fmt = nframes * "?" + nframes * "Q"
-                header = host_array(struct.calcsize(header_fmt))
-                await self.ep.recv(header)
-                header = struct.unpack(header_fmt, header)
-                cuda_frames, sizes = header[:nframes], header[nframes:]
-            except (
-                ucp.exceptions.UCXCloseError,
-                ucp.exceptions.UCXCanceled,
-            ) + (getattr(ucp.exceptions, "UCXConnectionReset", ()),):
-                self.abort()
-                raise CommClosedError("Connection closed by writer")
             else:
-                # Recv frames
-                frames = [
-                    device_array(each_size) if is_cuda else host_array(each_size)
-                    for is_cuda, each_size in zip(cuda_frames, sizes)
-                ]
-                cuda_recv_frames, recv_frames = zip(
-                    *(
-                        (is_cuda, each_frame)
-                        for is_cuda, each_frame in zip(cuda_frames, frames)
-                        if nbytes(each_frame) > 0
+                try:
+                    # Recv meta data
+
+                    # Recv close flag and number of frames (_Bool, int64)
+                    msg = host_array(struct.calcsize("?Q"))
+                    await self.ep.recv(msg)
+                    (shutdown, nframes) = struct.unpack("?Q", msg)
+
+                    if shutdown:  # The writer is closing the connection
+                        raise CommClosedError("Connection closed by writer")
+
+                    # Recv which frames are CUDA (bool) and
+                    # how large each frame is (uint64)
+                    header_fmt = nframes * "?" + nframes * "Q"
+                    header = host_array(struct.calcsize(header_fmt))
+                    await self.ep.recv(header)
+                    header = struct.unpack(header_fmt, header)
+                    cuda_frames, sizes = header[:nframes], header[nframes:]
+                except (
+                    ucp.UCXCloseError,
+                    ucp.UCXCanceled,
+                    # ) + (getattr(ucp, "UCXConnectionReset", ()),):
+                ) + (
+                    getattr(ucp, "UCXConnectionResetError", ()),
+                ):
+                    self.abort()
+                    raise CommClosedError("Connection closed by writer")
+                else:
+                    # Recv frames
+                    frames = [
+                        device_array(each_size) if is_cuda else host_array(each_size)
+                        for is_cuda, each_size in zip(cuda_frames, sizes)
+                    ]
+                    cuda_recv_frames, recv_frames = zip(
+                        *(
+                            (is_cuda, each_frame)
+                            for is_cuda, each_frame in zip(cuda_frames, frames)
+                            if nbytes(each_frame) > 0
+                        )
                     )
-                )
 
-                # It is necessary to first populate `frames` with CUDA arrays and synchronize
-                # the default stream before starting receiving to ensure buffers have been allocated
-                if any(cuda_recv_frames):
-                    synchronize_stream(0)
+                    # It is necessary to first populate `frames` with CUDA arrays and synchronize
+                    # the default stream before starting receiving to ensure buffers have been allocated
+                    if any(cuda_recv_frames):
+                        synchronize_stream(0)
 
-                for each_frame in recv_frames:
-                    await self.ep.recv(each_frame)
+                    # try:
+                    #     for each_frame in recv_frames:
+                    #         await self.ep.recv(each_frame)
+                    # except (
+                    #     ucp.UCXCloseError,
+                    #     ucp.UCXCanceled,
+                    # # ) + (getattr(ucp, "UCXConnectionReset", ()),):
+                    # ) + (getattr(ucp, "UCXConnectionResetError", ()),):
+                    #     self.abort()
+                    #     raise CommClosedError("Connection closed by writer")
+                    # for each_frame in recv_frames:
+                    #     await self.ep.recv(each_frame)
+                    # try:
+                    #     for each_frame in recv_frames:
+                    #         await self.ep.recv(each_frame)
+                    # except Exception as e:
+                    #     print(f"[{threading.get_native_id()}] recv each_frame exception in {hex(int(self._ep_handle))}: {type(e)} {e}")
+                    for each_frame in recv_frames:
+                        await self.ep.recv(each_frame)
+                    # print(f"recv_frames {type(recv_frames)}: {len(recv_frames)}")
                 msg = await from_frames(
                     frames,
                     deserialize=self.deserialize,
@@ -339,15 +361,14 @@ class UCX(Comm):
                 return msg
 
     async def close(self):
-        self._closed = True
         if self._ep is not None:
             try:
                 await self.ep.send(struct.pack("?Q", True, 0))
             except (
-                ucp.exceptions.UCXError,
-                ucp.exceptions.UCXCloseError,
-                ucp.exceptions.UCXCanceled,
-            ) + (getattr(ucp.exceptions, "UCXConnectionReset", ()),):
+                ucp.UCXError,
+                ucp.UCXCloseError,
+                ucp.UCXCanceled,
+            ) + (getattr(ucp, "UCXConnectionResetError", ()),):
                 # If the other end is in the process of closing,
                 # UCX will sometimes raise a `Input/output` error,
                 # which we can ignore.
@@ -356,7 +377,6 @@ class UCX(Comm):
             self._ep = None
 
     def abort(self):
-        self._closed = True
         if self._ep is not None:
             self._ep.abort()
             self._ep = None
@@ -369,13 +389,14 @@ class UCX(Comm):
             raise CommClosedError("UCX Endpoint is closed")
 
     def closed(self):
-        if self._has_close_callback is True:
-            # The self._closed flag is separate from the endpoint's lifetime, even when
-            # the endpoint has closed or errored, there may be messages on its buffer
-            # still to be received, even though sending is not possible anymore.
-            return self._closed
+        # Even if the endpoint has not been closed or aborted by Dask, the lifetime of
+        # the underlying endpoint may have changed if the remote endpoint has
+        # disconnected. In that case there may still exist enqueued messages on its
+        # buffer to be received, even though sending is not possible anymore.
+        if self._ep is not None:
+            return not self._ep.is_alive()
         else:
-            return self._ep is None
+            return True
 
 
 class UCXConnector(Connector):
@@ -389,10 +410,10 @@ class UCXConnector(Connector):
         init_once()
         try:
             ep = await ucp.create_endpoint(ip, port)
-        except (ucp.exceptions.UCXCloseError, ucp.exceptions.UCXCanceled,) + (
-            getattr(ucp.exceptions, "UCXConnectionReset", ()),
-            getattr(ucp.exceptions, "UCXNotConnected", ()),
-            getattr(ucp.exceptions, "UCXUnreachable", ()),
+        except (ucp.UCXCloseError, ucp.UCXCanceled,) + (
+            getattr(ucp, "UCXConnectionResetError", ()),
+            # getattr(ucp, "UCXNotConnected", ()),
+            # getattr(ucp, "UCXUnreachable", ()),
         ):  # type: ignore
             raise CommClosedError("Connection closed before handshake completed")
         return self.comm_class(
@@ -521,7 +542,7 @@ def _scrub_ucx_config():
     # 2) explicitly defined UCX configuration flags
 
     # import does not initialize ucp -- this will occur outside this function
-    from ucp import get_config
+    # from ucp import get_config
 
     options = {}
 
@@ -560,12 +581,12 @@ def _scrub_ucx_config():
 
         options = {"TLS": tls, "SOCKADDR_TLS_PRIORITY": tls_priority}
 
-    # ANY UCX options defined in config will overwrite high level dask.ucx flags
-    valid_ucx_vars = list(get_config().keys())
-    for k, v in options.items():
-        if k not in valid_ucx_vars:
-            logger.debug(
-                f"Key: {k} with value: {v} not a valid UCX configuration option"
-            )
+    # # ANY UCX options defined in config will overwrite high level dask.ucx flags
+    # valid_ucx_vars = list(get_config().keys())
+    # for k, v in options.items():
+    #     if k not in valid_ucx_vars:
+    #         logger.debug(
+    #             f"Key: {k} with value: {v} not a valid UCX configuration option"
+    #         )
 
     return options
