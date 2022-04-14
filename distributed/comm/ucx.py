@@ -8,7 +8,6 @@ See :ref:`communications` for more.
 import logging
 import os
 import struct
-import threading
 import warnings
 import weakref
 from typing import TYPE_CHECKING
@@ -45,7 +44,6 @@ else:
 device_array = None
 pre_existing_cuda_context = False
 cuda_context_created = False
-# UseAsyncio = True
 UseMulti = True
 
 
@@ -95,7 +93,6 @@ def init_once():
                 "of a program."
             )
 
-        print(f"[{threading.get_native_id()}] Creating CUDA Context", flush=True)
         numba.cuda.current_context()
 
         cuda_context_created = has_cuda_context()
@@ -216,7 +213,6 @@ class UCX(Comm):
             try:
                 if serializers is None:
                     serializers = ("cuda", "dask", "pickle", "error")
-                # msg can also be a list of dicts when sending batched messages
                 frames = await to_frames(
                     msg,
                     serializers=serializers,
@@ -226,7 +222,8 @@ class UCX(Comm):
                 sizes = tuple(nbytes(f) for f in frames)
 
                 if UseMulti is True:
-                    await self.ep.send_multi(frames)
+                    close = [struct.pack("?", False)]
+                    await self.ep.send_multi(close + frames)
                 else:
                     nframes = len(frames)
                     cuda_frames = tuple(
@@ -239,7 +236,6 @@ class UCX(Comm):
                             if nbytes(each_frame) > 0
                         )
                     )
-                    # print(f"send_frames {type(send_frames)}: {len(send_frames)}")
 
                     # Send meta data
 
@@ -276,6 +272,13 @@ class UCX(Comm):
             if UseMulti is True:
                 try:
                     frames = await self.ep.recv_multi()
+                    shutdown_frame = frames[0]
+                    frames = frames[1:]
+
+                    (shutdown,) = struct.unpack("?", shutdown_frame)
+
+                    if shutdown:  # The writer is closing the connection
+                        raise CommClosedError("Connection closed by writer")
                 except (
                     ucp.UCXCloseError,
                     ucp.UCXCanceled,
@@ -332,38 +335,23 @@ class UCX(Comm):
                     if any(cuda_recv_frames):
                         synchronize_stream(0)
 
-                    # try:
-                    #     for each_frame in recv_frames:
-                    #         await self.ep.recv(each_frame)
-                    # except (
-                    #     ucp.UCXCloseError,
-                    #     ucp.UCXCanceled,
-                    # # ) + (getattr(ucp, "UCXConnectionReset", ()),):
-                    # ) + (getattr(ucp, "UCXConnectionResetError", ()),):
-                    #     self.abort()
-                    #     raise CommClosedError("Connection closed by writer")
-                    # for each_frame in recv_frames:
-                    #     await self.ep.recv(each_frame)
-                    # try:
-                    #     for each_frame in recv_frames:
-                    #         await self.ep.recv(each_frame)
-                    # except Exception as e:
-                    #     print(f"[{threading.get_native_id()}] recv each_frame exception in {hex(int(self._ep_handle))}: {type(e)} {e}")
                     for each_frame in recv_frames:
                         await self.ep.recv(each_frame)
-                    # print(f"recv_frames {type(recv_frames)}: {len(recv_frames)}")
-                msg = await from_frames(
-                    frames,
-                    deserialize=self.deserialize,
-                    deserializers=deserializers,
-                    allow_offload=self.allow_offload,
-                )
-                return msg
+
+            return await from_frames(
+                frames,
+                deserialize=self.deserialize,
+                deserializers=deserializers,
+                allow_offload=self.allow_offload,
+            )
 
     async def close(self):
         if self._ep is not None:
             try:
-                await self.ep.send(struct.pack("?Q", True, 0))
+                if UseMulti:
+                    await self.ep.send_multi([struct.pack("?Q", True, 0)])
+                else:
+                    await self.ep.send(struct.pack("?Q", True, 0))
             except (
                 ucp.UCXError,
                 ucp.UCXCloseError,
