@@ -44,7 +44,7 @@ else:
 device_array = None
 pre_existing_cuda_context = False
 cuda_context_created = False
-UseMulti = True
+UseMulti = False
 
 
 def synchronize_stream(stream=0):
@@ -222,6 +222,9 @@ class UCX(Comm):
                 sizes = tuple(nbytes(f) for f in frames)
 
                 if UseMulti is True:
+                    if any(hasattr(f, "__cuda_array_interface__") for f in frames):
+                        synchronize_stream(0)
+
                     close = [struct.pack("?", False)]
                     await self.ep.send_multi(close + frames)
                 else:
@@ -271,6 +274,8 @@ class UCX(Comm):
 
             if UseMulti is True:
                 try:
+                    # TODO: We don't know if any frames are CUDA, investigate whether
+                    # we need to synchronize device here.
                     frames = await self.ep.recv_multi()
                     shutdown_frame = frames[0]
                     frames = frames[1:]
@@ -349,7 +354,7 @@ class UCX(Comm):
         if self._ep is not None:
             try:
                 if UseMulti:
-                    await self.ep.send_multi([struct.pack("?Q", True, 0)])
+                    await self.ep.send_multi([struct.pack("?", True)])
                 else:
                     await self.ep.send(struct.pack("?Q", True, 0))
             except (
