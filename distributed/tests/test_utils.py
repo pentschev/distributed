@@ -1,4 +1,3 @@
-import array
 import asyncio
 import contextvars
 import functools
@@ -7,6 +6,8 @@ import os
 import queue
 import socket
 import traceback
+import warnings
+from array import array
 from collections import deque
 from time import sleep
 
@@ -25,14 +26,15 @@ from distributed.utils import (
     LoopRunner,
     TimeoutError,
     _maybe_complex,
-    ensure_bytes,
     ensure_ip,
+    ensure_memoryview,
     format_dashboard_link,
     get_ip_interface,
     get_traceback,
     is_kernel,
     is_valid_xml,
     iscoroutinefunction,
+    log_errors,
     nbytes,
     offload,
     open_port,
@@ -57,7 +59,8 @@ from distributed.utils_test import (
 )
 
 
-def test_All(loop):
+@gen_test()
+async def test_All():
     async def throws():
         1 / 0
 
@@ -67,21 +70,18 @@ def test_All(loop):
     async def inc(x):
         return x + 1
 
-    async def f():
-        results = await All([inc(i) for i in range(10)])
-        assert results == list(range(1, 11))
+    results = await All([inc(i) for i in range(10)])
+    assert results == list(range(1, 11))
 
-        start = time()
-        for tasks in [[throws(), slow()], [slow(), throws()]]:
-            try:
-                await All(tasks)
-                assert False
-            except ZeroDivisionError:
-                pass
-            end = time()
-            assert end - start < 10
-
-    loop.run_sync(f)
+    start = time()
+    for tasks in [[throws(), slow()], [slow(), throws()]]:
+        try:
+            await All(tasks)
+            assert False
+        except ZeroDivisionError:
+            pass
+        end = time()
+        assert end - start < 10
 
 
 def test_sync_error(loop_in_thread):
@@ -121,10 +121,11 @@ def test_sync_timeout(loop_in_thread):
 
 
 def test_sync_closed_loop():
-    loop = IOLoop.current()
+    async def get_loop():
+        return IOLoop.current()
+
+    loop = asyncio.run(get_loop())
     loop.close()
-    IOLoop.clear_current()
-    IOLoop.clear_instance()
 
     with pytest.raises(RuntimeError) as exc_info:
         sync(loop, inc, 1)
@@ -247,25 +248,34 @@ def test_seek_delimiter_endline():
     assert f.tell() == 7
 
 
-def test_ensure_bytes():
-    data = [b"1", "1", memoryview(b"1"), bytearray(b"1"), array.array("b", [49])]
+def test_ensure_memoryview_empty():
+    result = ensure_memoryview(b"")
+    assert isinstance(result, memoryview)
+    assert result == memoryview(b"")
+
+
+def test_ensure_memoryview():
+    data = [b"1", memoryview(b"1"), bytearray(b"1"), array("B", b"1")]
     for d in data:
-        result = ensure_bytes(d)
-        assert isinstance(result, bytes)
-        assert result == b"1"
+        result = ensure_memoryview(d)
+        assert isinstance(result, memoryview)
+        assert result == memoryview(b"1")
 
 
-def test_ensure_bytes_ndarray():
+def test_ensure_memoryview_ndarray():
     np = pytest.importorskip("numpy")
-    result = ensure_bytes(np.arange(12))
-    assert isinstance(result, bytes)
+    result = ensure_memoryview(np.arange(12).reshape(3, 4)[:, ::2].T)
+    assert isinstance(result, memoryview)
+    assert result.ndim == 1
+    assert result.format == "B"
+    assert result.contiguous
 
 
-def test_ensure_bytes_pyarrow_buffer():
+def test_ensure_memoryview_pyarrow_buffer():
     pa = pytest.importorskip("pyarrow")
     buf = pa.py_buffer(b"123")
-    result = ensure_bytes(buf)
-    assert isinstance(result, bytes)
+    result = ensure_memoryview(buf)
+    assert isinstance(result, memoryview)
 
 
 def test_nbytes():
@@ -478,12 +488,12 @@ async def test_all_quiet_exceptions():
 
 
 def test_warn_on_duration():
-    with pytest.warns(None) as record:
+    with warnings.catch_warnings(record=True) as record:
         with warn_on_duration("10s", "foo"):
             pass
     assert not record
 
-    with pytest.warns(None) as record:
+    with pytest.warns(UserWarning, match=r"foo") as record:
         with warn_on_duration("1ms", "foo"):
             sleep(0.100)
 
@@ -563,13 +573,13 @@ def test_lru():
     assert list(l.keys()) == ["c", "a", "d"]
 
 
-@pytest.mark.asyncio
+@gen_test()
 async def test_offload():
     assert (await offload(inc, 1)) == 2
     assert (await offload(lambda x, y: x + y, 1, y=2)) == 3
 
 
-@pytest.mark.asyncio
+@gen_test()
 async def test_offload_preserves_contextvars():
     var = contextvars.ContextVar("var")
 
@@ -781,3 +791,112 @@ def test_recursive_to_dict_no_nest():
         ],
     }
     assert recursive_to_dict(info) == expect
+
+
+@gen_test()
+async def test_log_errors():
+    class CustomError(Exception):
+        pass
+
+    # Use the logger of the caller module
+    with captured_logger("test_utils") as caplog:
+
+        # Context manager
+        with log_errors():
+            pass
+
+        with log_errors():
+            with log_errors():
+                pass
+
+        with log_errors(pdb=True):
+            pass
+
+        with pytest.raises(CustomError):
+            with log_errors():
+                raise CustomError("err1")
+
+        with pytest.raises(CustomError):
+            with log_errors():
+                with log_errors():
+                    raise CustomError("err2")
+
+        # Bare decorator
+        @log_errors
+        def _():
+            return 123
+
+        assert _() == 123
+
+        @log_errors
+        def _():
+            raise CustomError("err3")
+
+        with pytest.raises(CustomError):
+            _()
+
+        @log_errors
+        def inner():
+            raise CustomError("err4")
+
+        @log_errors
+        def outer():
+            inner()
+
+        with pytest.raises(CustomError):
+            outer()
+
+        # Decorator with parameters
+        @log_errors()
+        def _():
+            return 456
+
+        assert _() == 456
+
+        @log_errors()
+        def _():
+            with log_errors():
+                raise CustomError("err5")
+
+        with pytest.raises(CustomError):
+            _()
+
+        @log_errors(pdb=True)
+        def _():
+            return 789
+
+        assert _() == 789
+
+        # Decorate async function
+        @log_errors
+        async def _():
+            return 123
+
+        assert await _() == 123
+
+        @log_errors
+        async def _():
+            raise CustomError("err6")
+
+        with pytest.raises(CustomError):
+            await _()
+
+    assert [row for row in caplog.getvalue().splitlines() if row.startswith("err")] == [
+        "err1",
+        "err2",
+        "err2",
+        "err3",
+        "err4",
+        "err4",
+        "err5",
+        "err5",
+        "err6",
+    ]
+
+    # Test unroll_stack
+    with captured_logger("distributed.utils") as caplog:
+        with pytest.raises(CustomError):
+            with log_errors(unroll_stack=0):
+                raise CustomError("err7")
+
+    assert caplog.getvalue().startswith("err7\n")
