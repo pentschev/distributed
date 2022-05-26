@@ -19,12 +19,11 @@ from tornado.ioloop import IOLoop
 import dask
 from dask.utils import tmpfile
 
-from distributed import Nanny, Scheduler, Worker, rpc, wait, worker
+from distributed import Nanny, Scheduler, Worker, profile, rpc, wait, worker
 from distributed.compatibility import LINUX, WINDOWS
 from distributed.core import CommClosedError, Status
 from distributed.diagnostics import SchedulerPlugin
 from distributed.metrics import time
-from distributed.profile import wait_profiler
 from distributed.protocol.pickle import dumps
 from distributed.utils import TimeoutError, parse_ports
 from distributed.utils_test import (
@@ -170,8 +169,8 @@ async def test_num_fds(s):
     # Warm up
     async with Nanny(s.address):
         pass
-    wait_profiler()
-    gc.collect()
+    with profile.lock:
+        gc.collect()
 
     before = proc.num_fds()
 
@@ -404,7 +403,7 @@ async def test_lifetime(s):
 
 
 @gen_cluster(client=True, nthreads=[])
-async def test_nanny_closes_cleanly_2(c, s):
+async def test_nanny_closes_cleanly_if_worker_is_terminated(c, s):
     async with Nanny(s.address) as n:
         async with c.rpc(n.worker_address) as w:
             IOLoop.current().add_callback(w.terminate)
@@ -568,3 +567,19 @@ async def test_restart_memory(c, s, n):
 
     while not s.workers:
         await asyncio.sleep(0.1)
+
+
+@gen_cluster(Worker=Nanny, nthreads=[("", 1)])
+async def test_scheduler_crash_doesnt_restart(s, a):
+    # Simulate a scheduler crash by disconnecting it first
+    # (`s.close()` would tell workers to cleanly shut down)
+    bcomm = next(iter(s.stream_comms.values()))
+    bcomm.abort()
+    await s.close()
+
+    while a.status != Status.closing_gracefully:
+        await asyncio.sleep(0.01)
+
+    await a.finished()
+    assert a.status == Status.closed
+    assert a.process is None

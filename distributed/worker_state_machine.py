@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, TypedDict
 import dask
 from dask.utils import parse_bytes
 
+from distributed.core import ErrorMessage, error_message
 from distributed.protocol.serialize import Serialize
 from distributed.utils import recursive_to_dict
 
@@ -257,44 +258,45 @@ class UniqueTaskHeap(Collection[TaskState]):
         return f"<{type(self).__name__}: {len(self)} items>"
 
 
+@dataclass
 class Instruction:
     """Command from the worker state machine to the Worker, in response to an event"""
 
-    __slots__ = ()
+    __slots__ = ("stimulus_id",)
+    stimulus_id: str
 
 
 @dataclass
 class GatherDep(Instruction):
+    __slots__ = ("worker", "to_gather", "total_nbytes")
     worker: str
     to_gather: set[str]
     total_nbytes: int
-    stimulus_id: str
-    __slots__ = tuple(__annotations__)  # type: ignore
 
 
 @dataclass
 class Execute(Instruction):
-    __slots__ = ("key", "stimulus_id")
+    __slots__ = ("key",)
     key: str
-    stimulus_id: str
 
 
-class SendMessageToScheduler(Instruction):
+@dataclass
+class EnsureCommunicatingAfterTransitions(Instruction):
     __slots__ = ()
+
+
+@dataclass
+class SendMessageToScheduler(Instruction):
     #: Matches a key in Scheduler.stream_handlers
     op: ClassVar[str]
+    __slots__ = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Convert object to dict so that it can be serialized with msgpack"""
         d = {k: getattr(self, k) for k in self.__annotations__}
         d["op"] = self.op
+        d["stimulus_id"] = self.stimulus_id
         return d
-
-
-@dataclass
-class EnsureCommunicatingAfterTransitions(Instruction):
-    __slots__ = ("stimulus_id",)
-    stimulus_id: str
 
 
 @dataclass
@@ -308,7 +310,6 @@ class TaskFinishedMsg(SendMessageToScheduler):
     metadata: dict
     thread: int | None
     startstops: list[StartStop]
-    stimulus_id: str
     __slots__ = tuple(__annotations__)  # type: ignore
 
     def to_dict(self) -> dict[str, Any]:
@@ -328,7 +329,6 @@ class TaskErredMsg(SendMessageToScheduler):
     traceback_text: str
     thread: int | None
     startstops: list[StartStop]
-    stimulus_id: str
     __slots__ = tuple(__annotations__)  # type: ignore
 
     def to_dict(self) -> dict[str, Any]:
@@ -341,9 +341,17 @@ class TaskErredMsg(SendMessageToScheduler):
 class ReleaseWorkerDataMsg(SendMessageToScheduler):
     op = "release-worker-data"
 
-    __slots__ = ("key", "stimulus_id")
+    __slots__ = ("key",)
     key: str
-    stimulus_id: str
+
+
+@dataclass
+class MissingDataMsg(SendMessageToScheduler):
+    op = "missing-data"
+
+    __slots__ = ("key", "errant_worker")
+    key: str
+    errant_worker: str
 
 
 # Not to be confused with RescheduleEvent below or the distributed.Reschedule Exception
@@ -351,10 +359,8 @@ class ReleaseWorkerDataMsg(SendMessageToScheduler):
 class RescheduleMsg(SendMessageToScheduler):
     op = "reschedule"
 
-    __slots__ = ("key", "worker", "stimulus_id")
+    __slots__ = ("key",)
     key: str
-    worker: str
-    stimulus_id: str
 
 
 @dataclass
@@ -370,9 +376,8 @@ class LongRunningMsg(SendMessageToScheduler):
 class AddKeysMsg(SendMessageToScheduler):
     op = "add-keys"
 
-    __slots__ = ("keys", "stimulus_id")
+    __slots__ = ("keys",)
     keys: list[str]
-    stimulus_id: str
 
 
 @dataclass
@@ -454,7 +459,6 @@ class ExecuteSuccessEvent(StateMachineEvent):
     stop: float
     nbytes: int
     type: type | None
-    stimulus_id: str
     __slots__ = tuple(__annotations__)  # type: ignore
 
     def to_loggable(self, *, handled: float) -> StateMachineEvent:
@@ -477,12 +481,37 @@ class ExecuteFailureEvent(StateMachineEvent):
     traceback: Serialize | None
     exception_text: str
     traceback_text: str
-    stimulus_id: str
     __slots__ = tuple(__annotations__)  # type: ignore
 
     def _after_from_dict(self) -> None:
         self.exception = Serialize(Exception())
         self.traceback = None
+
+    @classmethod
+    def from_exception(
+        cls,
+        err_or_msg: BaseException | ErrorMessage,
+        *,
+        key: str,
+        start: float | None = None,
+        stop: float | None = None,
+        stimulus_id: str,
+    ) -> ExecuteFailureEvent:
+        if isinstance(err_or_msg, dict):
+            msg = err_or_msg
+        else:
+            msg = error_message(err_or_msg)
+
+        return cls(
+            key=key,
+            start=start,
+            stop=stop,
+            exception=msg["exception"],
+            traceback=msg["traceback"],
+            exception_text=msg["exception_text"],
+            traceback_text=msg["traceback_text"],
+            stimulus_id=stimulus_id,
+        )
 
 
 @dataclass

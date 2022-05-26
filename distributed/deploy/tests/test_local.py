@@ -12,10 +12,9 @@ from tornado.ioloop import IOLoop
 
 from dask.system import CPU_COUNT
 
-from distributed import Client, Nanny, Worker, get_client
+from distributed import Client, LocalCluster, Nanny, Worker, get_client
 from distributed.compatibility import LINUX
 from distributed.core import Status
-from distributed.deploy.local import LocalCluster
 from distributed.deploy.utils_test import ClusterTest
 from distributed.metrics import time
 from distributed.system import MEMORY_LIMIT
@@ -29,6 +28,7 @@ from distributed.utils_test import (
     clean,
     gen_test,
     inc,
+    raises_with_cause,
     slowinc,
     tls_only_security,
     xfail_ssl_issue5601,
@@ -580,6 +580,34 @@ def test_ipywidgets(loop):
         cluster._ipython_display_()
         box = cluster._cached_widget
         assert isinstance(box, ipywidgets.Widget)
+
+
+def test_ipywidgets_loop(loop):
+    """
+    Previously cluster._ipython_display_ attached the PeriodicCallback to the
+    currently running loop, See https://github.com/dask/distributed/pull/6444
+    """
+    ipywidgets = pytest.importorskip("ipywidgets")
+
+    async def get_ioloop(cluster):
+        return cluster.periodic_callbacks["cluster-repr"].io_loop
+
+    async def amain():
+        # running synchronous code in an async context to setup a
+        # IOLoop.current() that's different from cluster.loop
+        with LocalCluster(
+            n_workers=0,
+            silence_logs=False,
+            loop=loop,
+            dashboard_address=":0",
+            processes=False,
+        ) as cluster:
+            cluster._ipython_display_()
+            assert cluster.sync(get_ioloop, cluster) is loop
+            box = cluster._cached_widget
+            assert isinstance(box, ipywidgets.Widget)
+
+    asyncio.run(amain())
 
 
 def test_no_ipywidgets(loop, monkeypatch):
@@ -1155,3 +1183,26 @@ async def test_connect_to_closed_cluster():
         # Raises during init without actually connecting since we're not
         # awaiting anything
         Client(cluster, asynchronous=True)
+
+
+class MyPlugin:
+    def setup(self, worker=None):
+        import my_nonexistent_library  # noqa
+
+
+@pytest.mark.slow
+@gen_test(
+    clean_kwargs={
+        # FIXME: This doesn't close the LoopRunner properly, leaving a thread around
+        "threads": False
+    }
+)
+async def test_localcluster_start_exception():
+    with raises_with_cause(RuntimeError, None, ImportError, "my_nonexistent_library"):
+        async with LocalCluster(
+            n_workers=1,
+            threads_per_worker=1,
+            processes=True,
+            plugins={MyPlugin()},
+        ):
+            return
