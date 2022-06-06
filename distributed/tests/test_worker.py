@@ -46,6 +46,8 @@ from distributed.metrics import time
 from distributed.protocol import pickle
 from distributed.scheduler import Scheduler
 from distributed.utils_test import (
+    BlockedGatherDep,
+    BlockedGetData,
     TaskStateMetadataPlugin,
     _LockedCommPool,
     assert_story,
@@ -1072,7 +1074,12 @@ async def test_scheduler_delay(c, s, a, b):
 
 
 @pytest.mark.flaky(reruns=10, reruns_delay=5)
-@gen_cluster(client=True)
+@gen_cluster(
+    client=True,
+    config={
+        "distributed.worker.profile.enabled": True,
+    },
+)
 async def test_statistical_profiling(c, s, a, b):
     futures = c.map(slowinc, range(10), delay=0.1)
     await wait(futures)
@@ -1087,6 +1094,7 @@ async def test_statistical_profiling(c, s, a, b):
     client=True,
     timeout=30,
     config={
+        "distributed.worker.profile.enabled": True,
         "distributed.worker.profile.interval": "1ms",
         "distributed.worker.profile.cycle": "100ms",
     },
@@ -1104,7 +1112,13 @@ async def test_statistical_profiling_2(c, s, a, b):
             break
 
 
-@gen_cluster(client=True, worker_kwargs={"profile_cycle_interval": "50 ms"})
+@gen_cluster(
+    client=True,
+    config={
+        "distributed.worker.profile.enabled": True,
+        "distributed.worker.profile.cycle": "100ms",
+    },
+)
 async def test_statistical_profiling_cycle(c, s, a, b):
     futures = c.map(slowinc, range(20), delay=0.05)
     await wait(futures)
@@ -1384,7 +1398,7 @@ async def test_interface_async(Worker):
 @pytest.mark.gpu
 @pytest.mark.parametrize("Worker", [Worker, Nanny])
 @gen_test()
-async def test_protocol_from_scheduler_address(Worker):
+async def test_protocol_from_scheduler_address(ucx_loop, Worker):
     pytest.importorskip("ucp")
 
     async with Scheduler(protocol="ucx", dashboard_address=":0") as s:
@@ -2588,81 +2602,6 @@ async def test_run_spec_deserialize_fail(c, s, a, b):
 
 
 @gen_cluster(client=True)
-async def test_gather_dep_exception_one_task(c, s, a, b):
-    """Ensure an exception in a single task does not tear down an entire batch of gather_dep
-
-
-    See also https://github.com/dask/distributed/issues/5152
-    See also test_gather_dep_exception_one_task_2
-    """
-    fut = c.submit(inc, 1, workers=[a.address], key="f1")
-    fut2 = c.submit(inc, 2, workers=[a.address], key="f2")
-    fut3 = c.submit(inc, 3, workers=[a.address], key="f3")
-
-    import asyncio
-
-    event = asyncio.Event()
-    write_queue = asyncio.Queue()
-    b.rpc = _LockedCommPool(b.rpc, write_event=event, write_queue=write_queue)
-    b.rpc.remove(a.address)
-
-    def sink(a, b, *args):
-        return a + b
-
-    res1 = c.submit(sink, fut, fut2, fut3, workers=[b.address])
-    res2 = c.submit(sink, fut, fut2, workers=[b.address])
-
-    # Wait until we're sure the worker is attempting to fetch the data
-    while True:
-        peer_addr, msg = await write_queue.get()
-        if peer_addr == a.address and msg["op"] == "get_data":
-            break
-
-    # Provoke an "impossible transision exception"
-    # By choosing a state which doesn't exist we're not running into validation
-    # errors and the state machine should raise if we want to transition from
-    # fetch to memory
-
-    b.validate = False
-    b.tasks[fut3.key].state = "fetch"
-    event.set()
-
-    assert await res1 == 5
-    assert await res2 == 5
-
-    del res1, res2, fut, fut2
-    fut3.release()
-
-    while a.tasks and b.tasks:
-        await asyncio.sleep(0.1)
-
-
-@gen_cluster(client=True)
-async def test_gather_dep_exception_one_task_2(c, s, a, b):
-    """Ensure an exception in a single task does not tear down an entire batch of gather_dep
-
-    The below triggers an fetch->memory transition
-
-    See also https://github.com/dask/distributed/issues/5152
-    See also test_gather_dep_exception_one_task
-    """
-    # This test does not trigger the condition reliably but is a very easy case
-    # which should function correctly regardless
-
-    fut1 = c.submit(inc, 1, workers=[a.address], key="f1")
-    fut2 = c.submit(inc, fut1, workers=[b.address], key="f2")
-
-    while fut1.key not in b.tasks or b.tasks[fut1.key].state == "flight":
-        await asyncio.sleep(0)
-
-    s.handle_missing_data(
-        key="f1", worker=b.address, errant_worker=a.address, stimulus_id="test"
-    )
-
-    await fut2
-
-
-@gen_cluster(client=True)
 async def test_acquire_replicas(c, s, a, b):
     fut = c.submit(inc, 1, workers=[a.address])
     await fut
@@ -3120,7 +3059,6 @@ async def test_task_flight_compute_oserror(c, s, a, b):
         ),
         # inc is lost and needs to be recomputed. Therefore, sum is released
         ("free-keys", ("f1",)),
-        ("f1", "release-key"),
         # The recommendations here are hard to predict. Whatever key is
         # currently scheduled to be fetched, if any, will be recommended to be
         # released.
@@ -3135,30 +3073,6 @@ async def test_task_flight_compute_oserror(c, s, a, b):
         ("f1", "executing", "memory", "memory", {}),
     ]
     assert_story(sum_story, expected_sum_story, strict=True)
-
-
-class BlockedGatherDep(Worker):
-    def __init__(self, *args, **kwargs):
-        self.in_gather_dep = asyncio.Event()
-        self.block_gather_dep = asyncio.Event()
-        super().__init__(*args, **kwargs)
-
-    async def gather_dep(self, *args, **kwargs):
-        self.in_gather_dep.set()
-        await self.block_gather_dep.wait()
-        return await super().gather_dep(*args, **kwargs)
-
-
-class BlockedGetData(Worker):
-    def __init__(self, *args, **kwargs):
-        self.in_get_data = asyncio.Event()
-        self.block_get_data = asyncio.Event()
-        super().__init__(*args, **kwargs)
-
-    async def get_data(self, comm, *args, **kwargs):
-        self.in_get_data.set()
-        await self.block_get_data.wait()
-        return await super().get_data(comm, *args, **kwargs)
 
 
 @gen_cluster(client=True, nthreads=[])

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import heapq
 import sys
-from collections.abc import Callable, Container, Iterator
+from collections.abc import Callable, Container
 from copy import copy
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Collection  # TODO move to collections.abc (requires Python >=3.9)
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, TypedDict
 
 import dask
@@ -175,6 +173,18 @@ class TaskState:
     def __repr__(self) -> str:
         return f"<TaskState {self.key!r} {self.state}>"
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, TaskState) or other.key != self.key:
+            return False
+        # When a task transitions to forgotten and exits Worker.tasks, it should be
+        # immediately dereferenced. If the same task is recreated later on on the
+        # worker, we should not have to deal with its previous incarnation lingering.
+        assert other is self
+        return True
+
+    def __hash__(self) -> int:
+        return hash(self.key)
+
     def get_nbytes(self) -> int:
         nbytes = self.nbytes
         return nbytes if nbytes is not None else _default_data_size()
@@ -206,58 +216,6 @@ class TaskState:
         )
 
 
-class UniqueTaskHeap(Collection[TaskState]):
-    """A heap of TaskState objects ordered by TaskState.priority.
-    Ties are broken by string comparison of the key. Keys are guaranteed to be
-    unique. Iterating over this object returns the elements in priority order.
-    """
-
-    __slots__ = ("_known", "_heap")
-    _known: set[str]
-    _heap: list[tuple[tuple[int, ...], str, TaskState]]
-
-    def __init__(self):
-        self._known = set()
-        self._heap = []
-
-    def push(self, ts: TaskState) -> None:
-        """Add a new TaskState instance to the heap. If the key is already
-        known, no object is added.
-
-        Note: This does not update the priority / heap order in case priority
-        changes.
-        """
-        assert isinstance(ts, TaskState)
-        if ts.key not in self._known:
-            assert ts.priority
-            heapq.heappush(self._heap, (ts.priority, ts.key, ts))
-            self._known.add(ts.key)
-
-    def pop(self) -> TaskState:
-        """Pop the task with highest priority from the heap."""
-        _, key, ts = heapq.heappop(self._heap)
-        self._known.remove(key)
-        return ts
-
-    def peek(self) -> TaskState:
-        """Get the highest priority TaskState without removing it from the heap"""
-        return self._heap[0][2]
-
-    def __contains__(self, x: object) -> bool:
-        if isinstance(x, TaskState):
-            x = x.key
-        return x in self._known
-
-    def __iter__(self) -> Iterator[TaskState]:
-        return (ts for _, _, ts in sorted(self._heap))
-
-    def __len__(self) -> int:
-        return len(self._known)
-
-    def __repr__(self) -> str:
-        return f"<{type(self).__name__}: {len(self)} items>"
-
-
 @dataclass
 class Instruction:
     """Command from the worker state machine to the Worker, in response to an event"""
@@ -278,6 +236,12 @@ class GatherDep(Instruction):
 class Execute(Instruction):
     __slots__ = ("key",)
     key: str
+
+
+@dataclass
+class RetryBusyWorkerLater(Instruction):
+    __slots__ = ("worker",)
+    worker: str
 
 
 @dataclass
@@ -336,6 +300,22 @@ class TaskErredMsg(SendMessageToScheduler):
         d["status"] = "error"
         return d
 
+    @staticmethod
+    def from_task(
+        ts: TaskState, stimulus_id: str, thread: int | None = None
+    ) -> TaskErredMsg:
+        assert ts.exception
+        return TaskErredMsg(
+            key=ts.key,
+            exception=ts.exception,
+            traceback=ts.traceback,
+            exception_text=ts.exception_text,
+            traceback_text=ts.traceback_text,
+            thread=thread,
+            startstops=ts.startstops,
+            stimulus_id=stimulus_id,
+        )
+
 
 @dataclass
 class ReleaseWorkerDataMsg(SendMessageToScheduler):
@@ -375,6 +355,26 @@ class LongRunningMsg(SendMessageToScheduler):
 @dataclass
 class AddKeysMsg(SendMessageToScheduler):
     op = "add-keys"
+
+    __slots__ = ("keys",)
+    keys: list[str]
+
+
+@dataclass
+class RequestRefreshWhoHasMsg(SendMessageToScheduler):
+    """Worker -> Scheduler asynchronous request for updated who_has information.
+    Not to be confused with the scheduler.who_has synchronous RPC call, which is used
+    by the Client.
+
+    See also
+    --------
+    RefreshWhoHasEvent
+    distributed.scheduler.Scheduler.request_refresh_who_has
+    distributed.client.Client.who_has
+    distributed.scheduler.Scheduler.get_who_has
+    """
+
+    op = "request-refresh-who-has"
 
     __slots__ = ("keys",)
     keys: list[str]
@@ -442,6 +442,12 @@ class StateMachineEvent:
 @dataclass
 class UnpauseEvent(StateMachineEvent):
     __slots__ = ()
+
+
+@dataclass
+class RetryBusyWorkerEvent(StateMachineEvent):
+    __slots__ = ("worker",)
+    worker: str
 
 
 @dataclass
@@ -531,6 +537,25 @@ class AlreadyCancelledEvent(StateMachineEvent):
 class RescheduleEvent(StateMachineEvent):
     __slots__ = ("key",)
     key: str
+
+
+@dataclass
+class FindMissingEvent(StateMachineEvent):
+    __slots__ = ()
+
+
+@dataclass
+class RefreshWhoHasEvent(StateMachineEvent):
+    """Scheduler -> Worker message containing updated who_has information.
+
+    See also
+    --------
+    RequestRefreshWhoHasMsg
+    """
+
+    __slots__ = ("who_has",)
+    # {key: [worker address, ...]}
+    who_has: dict[str, list[str]]
 
 
 if TYPE_CHECKING:

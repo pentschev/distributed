@@ -2882,6 +2882,14 @@ class Scheduler(SchedulerState, ServerNode):
         transition_counter_max=False,
         **kwargs,
     ):
+        if loop is not None:
+            warnings.warn(
+                "the loop kwarg to Scheduler is deprecated",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        self.loop = IOLoop.current()
         self._setup_logging(logger)
 
         # Attributes
@@ -2961,7 +2969,6 @@ class Scheduler(SchedulerState, ServerNode):
             )
 
         # Communication state
-        self.loop = loop or IOLoop.current()
         self.client_comms = {}
         self.stream_comms = {}
         self._worker_coroutines = []
@@ -3024,6 +3031,7 @@ class Scheduler(SchedulerState, ServerNode):
             "keep-alive": lambda *args, **kwargs: None,
             "log-event": self.log_worker_event,
             "worker-status-change": self.handle_worker_status_change,
+            "request-refresh-who-has": self.handle_request_refresh_who_has,
         }
 
         client_handlers = {
@@ -3358,8 +3366,14 @@ class Scheduler(SchedulerState, ServerNode):
             await self.finished()
             return
 
+        async def log_errors(func):
+            try:
+                await func()
+            except Exception:
+                logger.exception("Plugin call failed during scheduler.close")
+
         await asyncio.gather(
-            *[plugin.before_close() for plugin in list(self.plugins.values())]
+            *[log_errors(plugin.before_close) for plugin in list(self.plugins.values())]
         )
 
         self.status = Status.closing
@@ -3368,10 +3382,13 @@ class Scheduler(SchedulerState, ServerNode):
         setproctitle("dask-scheduler [closing]")
 
         for preload in self.preloads:
-            await preload.teardown()
+            try:
+                await preload.teardown()
+            except Exception as e:
+                logger.exception(e)
 
         await asyncio.gather(
-            *[plugin.close() for plugin in list(self.plugins.values())]
+            *[log_errors(plugin.close) for plugin in list(self.plugins.values())]
         )
 
         for pc in self.periodic_callbacks.values():
@@ -4765,6 +4782,21 @@ class Scheduler(SchedulerState, ServerNode):
                 self.send_all(client_msgs, worker_msgs)
         else:
             self.running.discard(ws)
+
+    async def handle_request_refresh_who_has(
+        self, keys: Iterable[str], worker: str, stimulus_id: str
+    ) -> None:
+        """Asynchronous request (through bulk comms) from a Worker to refresh the
+        who_has for some keys. Not to be confused with scheduler.who_has, which is a
+        synchronous RPC request from a Client.
+        """
+        self.stream_comms[worker].send(
+            {
+                "op": "refresh-who-has",
+                "who_has": self.get_who_has(keys),
+                "stimulus_id": stimulus_id,
+            },
+        )
 
     async def handle_worker(self, comm=None, worker=None, stimulus_id=None):
         """
@@ -6214,13 +6246,13 @@ class Scheduler(SchedulerState, ServerNode):
                 w: [ts.key for ts in ws.processing] for w, ws in self.workers.items()
             }
 
-    def get_who_has(self, keys=None):
+    def get_who_has(self, keys: Iterable[str] | None = None) -> dict[str, list[str]]:
         if keys is not None:
             return {
-                k: [ws.address for ws in self.tasks[k].who_has]
-                if k in self.tasks
+                key: [ws.address for ws in self.tasks[key].who_has]
+                if key in self.tasks
                 else []
-                for k in keys
+                for key in keys
             }
         else:
             return {
