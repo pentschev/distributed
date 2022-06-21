@@ -43,9 +43,9 @@ from distributed.security import Security
 from distributed.utils import (
     TimeoutError,
     get_ip,
+    get_mp_context,
     json_load_robust,
     log_errors,
-    mp_context,
     parse_ports,
     silence_logging,
 )
@@ -134,8 +134,16 @@ class Nanny(ServerNode):
         config=None,
         **worker_kwargs,
     ):
+        if loop is not None:
+            warnings.warn(
+                "the `loop` kwarg to `Nanny` is ignored, and will be removed in a future release. "
+                "The Nanny always binds to the current loop.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         self._setup_logging(logger)
-        self.loop = loop or IOLoop.current()
+        self.loop = self.io_loop = IOLoop.current()
 
         if isinstance(security, dict):
             security = Security(**security)
@@ -246,9 +254,7 @@ class Nanny(ServerNode):
 
         self.plugins: dict[str, NannyPlugin] = {}
 
-        super().__init__(
-            handlers=handlers, io_loop=self.loop, connection_args=self.connection_args
-        )
+        super().__init__(handlers=handlers, connection_args=self.connection_args)
 
         self.scheduler = self.rpc(self.scheduler_addr)
         self.memory_manager = NannyMemoryManager(self, memory_limit=memory_limit)
@@ -632,8 +638,8 @@ class WorkerProcess:
             await self.running.wait()
             return self.status
 
-        self.init_result_q = init_q = mp_context.Queue()
-        self.child_stop_q = mp_context.Queue()
+        self.init_result_q = init_q = get_mp_context().Queue()
+        self.child_stop_q = get_mp_context().Queue()
         uid = uuid.uuid4().hex
 
         self.process = AsyncProcess(
@@ -803,12 +809,10 @@ class WorkerProcess:
         try:
             os.environ.update(env)
             dask.config.set(config)
-            try:
-                from dask.multiprocessing import initialize_worker_process
-            except ImportError:  # old Dask version
-                pass
-            else:
-                initialize_worker_process()
+
+            from dask.multiprocessing import default_initializer
+
+            default_initializer()
 
             if silence_logs:
                 logger.setLevel(silence_logs)

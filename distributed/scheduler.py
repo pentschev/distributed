@@ -347,7 +347,10 @@ class MemoryState:
 
 
 class WorkerState:
-    """A simple object holding information about a worker."""
+    """A simple object holding information about a worker.
+
+    Not to be confused with :class:`distributed.worker_state_machine.WorkerState`.
+    """
 
     #: This worker's unique key. This can be its connected address
     #: (such as ``"tcp://127.0.0.1:8891"``) or an alias (such as ``"alice"``).
@@ -1062,7 +1065,12 @@ class TaskState:
     #: Cached hash of :attr:`~TaskState.client_key`
     _hash: int
 
+    # Support for weakrefs to a class with __slots__
+    __weakref__: Any = None
     __slots__ = tuple(__annotations__)  # type: ignore
+
+    # Instances not part of slots since class variable
+    _instances: ClassVar[weakref.WeakSet[TaskState]] = weakref.WeakSet()
 
     def __init__(self, key: str, run_spec: object):
         self.key = key
@@ -1088,7 +1096,7 @@ class TaskState:
         self.has_lost_dependencies = False
         self.host_restrictions = None  # type: ignore
         self.worker_restrictions = None  # type: ignore
-        self.resource_restrictions = None  # type: ignore
+        self.resource_restrictions = {}
         self.loose_restrictions = False
         self.actor = False
         self.prefix = None  # type: ignore
@@ -1098,6 +1106,7 @@ class TaskState:
         self.metadata = {}
         self.annotations = {}
         self.erred_on = set()
+        TaskState._instances.add(self)
 
     def __hash__(self) -> int:
         return self._hash
@@ -1262,6 +1271,7 @@ class SchedulerState:
         "validate",
         "workers",
         "transition_counter",
+        "_idle_transition_counter",
         "transition_counter_max",
         "plugins",
         "UNKNOWN_TASK_DURATION",
@@ -1339,6 +1349,7 @@ class SchedulerState:
             / 2.0
         )
         self.transition_counter = 0
+        self._idle_transition_counter = 0
         self.transition_counter_max = transition_counter_max
 
     @property
@@ -2670,14 +2681,12 @@ class SchedulerState:
         return s
 
     def consume_resources(self, ts: TaskState, ws: WorkerState):
-        if ts.resource_restrictions:
-            for r, required in ts.resource_restrictions.items():
-                ws.used_resources[r] += required
+        for r, required in ts.resource_restrictions.items():
+            ws.used_resources[r] += required
 
     def release_resources(self, ts: TaskState, ws: WorkerState):
-        if ts.resource_restrictions:
-            for r, required in ts.resource_restrictions.items():
-                ws.used_resources[r] -= required
+        for r, required in ts.resource_restrictions.items():
+            ws.used_resources[r] -= required
 
     def coerce_hostname(self, host):
         """
@@ -2889,7 +2898,7 @@ class Scheduler(SchedulerState, ServerNode):
                 stacklevel=2,
             )
 
-        self.loop = IOLoop.current()
+        self.loop = self.io_loop = IOLoop.current()
         self._setup_logging(logger)
 
         # Attributes
@@ -3025,7 +3034,6 @@ class Scheduler(SchedulerState, ServerNode):
             "task-erred": self.handle_task_erred,
             "release-worker-data": self.release_worker_data,
             "add-keys": self.add_keys,
-            "missing-data": self.handle_missing_data,
             "long-running": self.handle_long_running,
             "reschedule": self.reschedule,
             "keep-alive": lambda *args, **kwargs: None,
@@ -3072,7 +3080,7 @@ class Scheduler(SchedulerState, ServerNode):
             "get_logs": self.get_logs,
             "logs": self.get_logs,
             "worker_logs": self.get_worker_logs,
-            "log_event": self.log_worker_event,
+            "log_event": self.log_event,
             "events": self.get_events,
             "nbytes": self.get_nbytes,
             "versions": self.versions,
@@ -3125,7 +3133,6 @@ class Scheduler(SchedulerState, ServerNode):
             self,
             handlers=self.handlers,
             stream_handlers=merge(worker_handlers, client_handlers),
-            io_loop=self.loop,
             connection_limit=connection_limit,
             deserialize=False,
             connection_args=self.connection_args,
@@ -3344,7 +3351,10 @@ class Scheduler(SchedulerState, ServerNode):
             weakref.finalize(self, del_scheduler_file)
 
         for preload in self.preloads:
-            await preload.start()
+            try:
+                await preload.start()
+            except Exception:
+                logger.exception("Failed to start preload")
 
         await asyncio.gather(
             *[plugin.start(self) for plugin in list(self.plugins.values())]
@@ -3355,13 +3365,18 @@ class Scheduler(SchedulerState, ServerNode):
         setproctitle(f"dask-scheduler [{self.address}]")
         return self
 
-    async def close(self):
+    async def close(self, fast=None, close_workers=None):
         """Send cleanup signal to all coroutines then wait until finished
 
         See Also
         --------
         Scheduler.cleanup
         """
+        if fast is not None or close_workers is not None:
+            warnings.warn(
+                "The 'fast' and 'close_workers' parameters in Scheduler.close have no effect and will be removed in a future version of distributed.",
+                FutureWarning,
+            )
         if self.status in (Status.closing, Status.closed):
             await self.finished()
             return
@@ -3384,8 +3399,8 @@ class Scheduler(SchedulerState, ServerNode):
         for preload in self.preloads:
             try:
                 await preload.teardown()
-            except Exception as e:
-                logger.exception(e)
+            except Exception:
+                logger.exception("Failed to tear down preload")
 
         await asyncio.gather(
             *[log_errors(plugin.close) for plugin in list(self.plugins.values())]
@@ -4670,40 +4685,6 @@ class Scheduler(SchedulerState, ServerNode):
         self._transitions(recommendations, client_msgs, worker_msgs, stimulus_id)
         self.send_all(client_msgs, worker_msgs)
 
-    def handle_missing_data(
-        self, key: str, worker: str, errant_worker: str, stimulus_id: str
-    ) -> None:
-        """Signal that `errant_worker` does not hold `key`.
-
-        This may either indicate that `errant_worker` is dead or that we may be working
-        with stale data and need to remove `key` from the workers `has_what`. If no
-        replica of a task is available anymore, the task is transitioned back to
-        released and rescheduled, if possible.
-
-        Parameters
-        ----------
-        key : str
-            Task key that could not be found
-        worker : str
-            Address of the worker informing the scheduler
-        errant_worker : str
-            Address of the worker supposed to hold a replica
-        """
-        logger.debug(f"handle missing data {key=} {worker=} {errant_worker=}")
-        self.log_event(errant_worker, {"action": "missing-data", "key": key})
-
-        ts = self.tasks.get(key)
-        ws = self.workers.get(errant_worker)
-        if not ts or not ws or ws not in ts.who_has:
-            return
-
-        self.remove_replica(ts, ws)
-        if ts.state == "memory" and not ts.who_has:
-            if ts.run_spec:
-                self.transitions({key: "released"}, stimulus_id)
-            else:
-                self.transitions({key: "forgotten"}, stimulus_id)
-
     def release_worker_data(self, key: str, worker: str, stimulus_id: str) -> None:
         ts = self.tasks.get(key)
         ws = self.workers.get(worker)
@@ -5091,19 +5072,19 @@ class Scheduler(SchedulerState, ServerNode):
                 stimulus_id=stimulus_id,
             )
 
-        nannies = {addr: ws.nanny for addr, ws in self.workers.items()}
+        nanny_workers = {
+            addr: ws.nanny for addr, ws in self.workers.items() if ws.nanny
+        }
 
-        for addr in list(self.workers):
-            try:
-                # Ask the worker to close if it doesn't have a nanny,
-                # otherwise the nanny will kill it anyway
-                await self.remove_worker(
-                    address=addr, close=addr not in nannies, stimulus_id=stimulus_id
-                )
-            except Exception:
-                logger.info(
-                    "Exception while restarting.  This is normal", exc_info=True
-                )
+        # Close non-Nanny workers. We have no way to restart them, so we just let them go,
+        # and assume a deployment system is going to restart them for us.
+        await asyncio.gather(
+            *(
+                self.remove_worker(address=addr, stimulus_id=stimulus_id)
+                for addr in self.workers
+                if addr not in nanny_workers
+            )
+        )
 
         self.clear_task_state()
 
@@ -5113,21 +5094,27 @@ class Scheduler(SchedulerState, ServerNode):
             except Exception as e:
                 logger.exception(e)
 
-        logger.debug("Send kill signal to nannies: %s", nannies)
+        logger.debug("Send kill signal to nannies: %s", nanny_workers)
         async with contextlib.AsyncExitStack() as stack:
             nannies = [
                 await stack.enter_async_context(
                     rpc(nanny_address, connection_args=self.connection_args)
                 )
-                for nanny_address in nannies.values()
-                if nanny_address is not None
+                for nanny_address in nanny_workers.values()
             ]
 
-            resps = All(
-                [nanny.restart(close=True, timeout=timeout * 0.8) for nanny in nannies]
-            )
             try:
-                resps = await asyncio.wait_for(resps, timeout)
+                resps = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(
+                            nanny.restart(close=True, timeout=timeout * 0.8)
+                            for nanny in nannies
+                        )
+                    ),
+                    timeout,
+                )
+                # NOTE: the `WorkerState` entries for these workers will be removed
+                # naturally when they disconnect from the scheduler.
             except TimeoutError:
                 logger.error(
                     "Nannies didn't report back restarted within "
@@ -6226,7 +6213,11 @@ class Scheduler(SchedulerState, ServerNode):
             if teardown:
                 teardown(self, state)
 
-    def log_worker_event(self, worker=None, topic=None, msg=None):
+    def log_worker_event(
+        self, worker: str, topic: str | Collection[str], msg: Any
+    ) -> None:
+        if isinstance(msg, dict):
+            msg["worker"] = worker
         self.log_event(topic, msg)
 
     def subscribe_worker_status(self, comm=None):
@@ -6556,13 +6547,16 @@ class Scheduler(SchedulerState, ServerNode):
         self._transitions(recommendations, client_msgs, worker_msgs, stimulus_id)
         self.send_all(client_msgs, worker_msgs)
 
-    def story(self, *keys):
-        """Get all transitions that touch one of the input keys"""
-        keys = {key.key if isinstance(key, TaskState) else key for key in keys}
-        return scheduler_story(keys, self.transition_log)
+    def story(self, *keys_or_tasks_or_stimuli: str | TaskState) -> list[tuple]:
+        """Get all transitions that touch one of the input keys or stimulus_id's"""
+        keys_or_stimuli = {
+            key.key if isinstance(key, TaskState) else key
+            for key in keys_or_tasks_or_stimuli
+        }
+        return scheduler_story(keys_or_stimuli, self.transition_log)
 
-    async def get_story(self, keys=()):
-        return self.story(*keys)
+    async def get_story(self, keys_or_stimuli: Iterable[str]) -> list[tuple]:
+        return self.story(*keys_or_stimuli)
 
     transition_story = story
 
@@ -6908,21 +6902,21 @@ class Scheduler(SchedulerState, ServerNode):
         )
         return results
 
-    def log_event(self, name, msg):
+    def log_event(self, topic: str | Collection[str], msg: Any) -> None:
         event = (time(), msg)
-        if isinstance(name, (list, tuple)):
-            for n in name:
-                self.events[n].append(event)
-                self.event_counts[n] += 1
-                self._report_event(n, event)
+        if not isinstance(topic, str):
+            for t in topic:
+                self.events[t].append(event)
+                self.event_counts[t] += 1
+                self._report_event(t, event)
         else:
-            self.events[name].append(event)
-            self.event_counts[name] += 1
-            self._report_event(name, event)
+            self.events[topic].append(event)
+            self.event_counts[topic] += 1
+            self._report_event(topic, event)
 
             for plugin in list(self.plugins.values()):
                 try:
-                    plugin.log_event(name, msg)
+                    plugin.log_event(topic, msg)
                 except Exception:
                     logger.info("Plugin failed with exception", exc_info=True)
 
@@ -7027,13 +7021,23 @@ class Scheduler(SchedulerState, ServerNode):
                 await self.remove_worker(address=ws.address, stimulus_id=stimulus_id)
 
     def check_idle(self):
+        if self.status in (Status.closing, Status.closed):
+            return
+
+        if self.transition_counter != self._idle_transition_counter:
+            self._idle_transition_counter = self.transition_counter
+            self.idle_since = None
+            return
+
         if any([ws.processing for ws in self.workers.values()]) or self.unrunnable:
             self.idle_since = None
             return
-        elif not self.idle_since:
+
+        if not self.idle_since:
             self.idle_since = time()
 
         if time() > self.idle_since + self.idle_timeout:
+            assert self.idle_since
             logger.info(
                 "Scheduler closing after being idle for %s",
                 format_time(self.idle_timeout),
@@ -7092,29 +7096,33 @@ class Scheduler(SchedulerState, ServerNode):
             to_close = self.workers_to_close()
             return len(self.workers) - len(to_close)
 
-    def request_acquire_replicas(self, addr: str, keys: list, *, stimulus_id: str):
+    def request_acquire_replicas(
+        self, addr: str, keys: Iterable[str], *, stimulus_id: str
+    ) -> None:
         """Asynchronously ask a worker to acquire a replica of the listed keys from
         other workers. This is a fire-and-forget operation which offers no feedback for
         success or failure, and is intended for housekeeping and not for computation.
         """
         who_has = {}
+        nbytes = {}
         for key in keys:
             ts = self.tasks[key]
-            who_has[key] = {ws.address for ws in ts.who_has}
-
-        if self.validate:
-            assert all(who_has.values())
+            assert ts.who_has
+            who_has[key] = [ws.address for ws in ts.who_has]
+            nbytes[key] = ts.nbytes
 
         self.stream_comms[addr].send(
             {
                 "op": "acquire-replicas",
-                "keys": keys,
                 "who_has": who_has,
+                "nbytes": nbytes,
                 "stimulus_id": stimulus_id,
             },
         )
 
-    def request_remove_replicas(self, addr: str, keys: list, *, stimulus_id: str):
+    def request_remove_replicas(
+        self, addr: str, keys: list[str], *, stimulus_id: str
+    ) -> None:
         """Asynchronously ask a worker to discard its replica of the listed keys.
         This must never be used to destroy the last replica of a key. This is a
         fire-and-forget operation, intended for housekeeping and not for computation.
@@ -7125,15 +7133,14 @@ class Scheduler(SchedulerState, ServerNode):
         to re-add itself to who_has. If the worker agrees to discard the task, there is
         no feedback.
         """
-        ws: WorkerState = self.workers[addr]
-        validate = self.validate
+        ws = self.workers[addr]
 
         # The scheduler immediately forgets about the replica and suggests the worker to
         # drop it. The worker may refuse, at which point it will send back an add-keys
         # message to reinstate it.
         for key in keys:
-            ts: TaskState = self.tasks[key]
-            if validate:
+            ts = self.tasks[key]
+            if self.validate:
                 # Do not destroy the last copy
                 assert len(ts.who_has) > 1
             self.remove_replica(ts, ws)
@@ -7314,22 +7321,16 @@ def _task_to_msg(
             dts.key: [ws.address for ws in dts.who_has] for dts in ts.dependencies
         },
         "nbytes": {dts.key: dts.nbytes for dts in ts.dependencies},
+        "run_spec": ts.run_spec,
+        "resource_restrictions": ts.resource_restrictions,
+        "actor": ts.actor,
+        "annotations": ts.annotations,
     }
     if state.validate:
         assert all(msg["who_has"].values())
-
-    if ts.resource_restrictions:
-        msg["resource_restrictions"] = ts.resource_restrictions
-    if ts.actor:
-        msg["actor"] = True
-
-    if isinstance(ts.run_spec, dict):
-        msg.update(ts.run_spec)
-    else:
-        msg["task"] = ts.run_spec
-
-    if ts.annotations:
-        msg["annotations"] = ts.annotations
+        if isinstance(msg["run_spec"], dict):
+            assert set(msg["run_spec"]).issubset({"function", "args", "kwargs"})
+            assert msg["run_spec"].get("function")
 
     return msg
 
