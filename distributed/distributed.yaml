@@ -206,6 +206,7 @@ distributed:
       infiniband: null  # enable Infiniband
       rdmacm: null  # enable RDMACM
       create-cuda-context: null  # create CUDA context before UCX initialization
+      multi-buffer: null  # use UCXX multi-buffer transfer API
 
     zstd:
       level: 3      # Compression level, between 1 and 22.

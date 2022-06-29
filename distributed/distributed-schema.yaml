@@ -892,6 +892,10 @@ properties:
                   additional variables for each transport, while ensuring optimal connectivity. When
                   ``True``, a CUDA context will be created on the first device listed in
                   ``CUDA_VISIBLE_DEVICES``.
+              multi-buffer:
+                type: [boolean, 'null']
+                description: |
+                  Use UCXX's multi-buffer transfer API to reduce asyncio overhead.
 
           tcp:
             type: object

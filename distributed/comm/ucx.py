@@ -44,7 +44,7 @@ else:
 device_array = None
 pre_existing_cuda_context = False
 cuda_context_created = False
-UseMulti = False
+multi_buffer = None
 
 
 _warning_suffix = (
@@ -81,6 +81,7 @@ def init_once():
     global ucp, device_array
     global ucx_create_endpoint, ucx_create_listener
     global pre_existing_cuda_context, cuda_context_created
+    global multi_buffer
 
     if ucp is not None:
         return
@@ -118,6 +119,8 @@ def init_once():
             _warn_cuda_context_wrong_device(
                 cuda_visible_device, cuda_context_created, os.getpid()
             )
+
+    multi_buffer = dask.config.get("distributed.comm.ucx.multi-buffer")
 
     # import ucp as _ucp
     import ucxx as _ucp
@@ -239,7 +242,7 @@ class UCX(Comm):
             )
             sizes = tuple(nbytes(f) for f in frames)
 
-            if UseMulti is True:
+            if multi_buffer is True:
                 if any(hasattr(f, "__cuda_array_interface__") for f in frames):
                     synchronize_stream(0)
 
@@ -290,7 +293,7 @@ class UCX(Comm):
         if deserializers is None:
             deserializers = ("cuda", "dask", "pickle", "error")
 
-        if UseMulti is True:
+        if multi_buffer is True:
             try:
                 # TODO: We don't know if any frames are CUDA, investigate whether
                 # we need to synchronize device here.
@@ -371,7 +374,7 @@ class UCX(Comm):
     async def close(self):
         if self._ep is not None:
             try:
-                if UseMulti:
+                if multi_buffer is True:
                     await self.ep.send_multi([struct.pack("?", True)])
                 else:
                     await self.ep.send(struct.pack("?Q", True, 0))
