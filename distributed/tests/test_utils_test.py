@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import pathlib
@@ -8,6 +10,7 @@ import sys
 import textwrap
 import threading
 from contextlib import contextmanager
+from multiprocessing.synchronize import Barrier
 from time import sleep
 from unittest import mock
 
@@ -42,9 +45,11 @@ from distributed.utils_test import (
     raises_with_cause,
     tls_only_security,
     wait_for_state,
+    wait_for_stimulus,
 )
 from distributed.worker import fail_hard
 from distributed.worker_state_machine import (
+    ComputeTaskEvent,
     InvalidTaskState,
     InvalidTransition,
     PauseEvent,
@@ -587,7 +592,9 @@ else:
     TERM_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
-def garbage_process(barrier, ignore_sigterm: bool = False, t: float = 3600) -> None:
+def garbage_process(
+    barrier: Barrier, ignore_sigterm: bool = False, t: float = 3600
+) -> None:
     if ignore_sigterm:
         for signum in TERM_SIGNALS:
             signal.signal(signum, signal.SIG_IGN)
@@ -826,7 +833,7 @@ def test_popen_write_during_terminate_deadlock():
     # `subprocess.TimeoutExpired` if this test breaks.
 
 
-def test_popen_timeout(capsys: pytest.CaptureFixture):
+def test_popen_timeout(capsys):
     with pytest.raises(subprocess.TimeoutExpired):
         with popen(
             [
@@ -867,7 +874,7 @@ def test_popen_timeout(capsys: pytest.CaptureFixture):
     assert "slept" in captured.out
 
 
-def test_popen_always_prints_output(capsys: pytest.CaptureFixture):
+def test_popen_always_prints_output(capsys):
     # We always print stdout even if there was no error, in case some other assertion
     # later in the test fails and the output would be useful.
     with popen([sys.executable, "-c", "print('foo')"], capture_output=True) as proc:
@@ -915,7 +922,7 @@ async def test_freeze_batched_send():
         assert e.count == 3
 
 
-@gen_cluster(client=True, nthreads=[("", 1)], timeout=2)
+@gen_cluster(client=True, nthreads=[("", 1)])
 async def test_wait_for_state(c, s, a, capsys):
     ev = Event()
     x = c.submit(lambda ev: ev.wait(), ev, key="x")
@@ -942,3 +949,22 @@ async def test_wait_for_state(c, s, a, capsys):
         f"tasks[x].state='memory' on {s.address}; expected state='bad_state'\n"
         f"tasks[y] not found on {s.address}\n"
     )
+
+
+@gen_cluster(client=True, nthreads=[("", 1)])
+async def test_wait_for_stimulus(c, s, a):
+    t1 = asyncio.create_task(wait_for_stimulus(ComputeTaskEvent, a))
+    t2 = asyncio.create_task(wait_for_stimulus(ComputeTaskEvent, a, key="y"))
+    await asyncio.sleep(0.05)
+    assert not t1.done()
+    assert not t2.done()
+
+    x = c.submit(inc, 1, key="x")
+    ev = await t1
+    assert isinstance(ev, ComputeTaskEvent)
+    await wait_for_stimulus(ComputeTaskEvent, a, key="x")
+    await c.run(wait_for_stimulus, ComputeTaskEvent, key="x")
+    assert not t2.done()
+
+    y = c.submit(inc, 1, key="y")
+    await t2

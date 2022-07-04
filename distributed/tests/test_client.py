@@ -7,6 +7,7 @@ import gc
 import inspect
 import logging
 import os
+import pathlib
 import pickle
 import random
 import subprocess
@@ -4298,11 +4299,12 @@ async def test_retire_many_workers(c, s, *workers):
 @gen_cluster(
     client=True,
     nthreads=[("127.0.0.1", 3)] * 2,
-    config={"distributed.scheduler.default-task-durations": {"f": "10ms"}},
+    config={
+        "distributed.scheduler.work-stealing": False,
+        "distributed.scheduler.default-task-durations": {"f": "10ms"},
+    },
 )
 async def test_weight_occupancy_against_data_movement(c, s, a, b):
-    await s.extensions["stealing"].stop()
-
     def f(x, y=0, z=0):
         sleep(0.01)
         return x
@@ -4321,11 +4323,12 @@ async def test_weight_occupancy_against_data_movement(c, s, a, b):
 @gen_cluster(
     client=True,
     nthreads=[("127.0.0.1", 1), ("127.0.0.1", 10)],
-    config={"distributed.scheduler.default-task-durations": {"f": "10ms"}},
+    config={
+        "distributed.scheduler.work-stealing": False,
+        "distributed.scheduler.default-task-durations": {"f": "10ms"},
+    },
 )
 async def test_distribute_tasks_by_nthreads(c, s, a, b):
-    await s.extensions["stealing"].stop()
-
     def f(x, y=0):
         sleep(0.01)
         return x
@@ -4433,7 +4436,7 @@ async def test_auto_normalize_collection(c, s, a, b):
     assert len(x.dask) == 2
 
     with dask.config.set(optimizations=[c._optimize_insert_futures]):
-        y = x.map_blocks(slowinc, delay=1, dtype=x.dtype)
+        y = x.map_blocks(inc, dtype=x.dtype)
         yy = c.persist(y)
 
         await wait(yy)
@@ -4456,7 +4459,7 @@ def test_auto_normalize_collection_sync(c):
     da = pytest.importorskip("dask.array")
     x = da.ones(10, chunks=5)
 
-    y = x.map_blocks(slowinc, delay=1, dtype=x.dtype)
+    y = x.map_blocks(inc, dtype=x.dtype)
     yy = c.persist(y)
 
     wait(yy)
@@ -5134,7 +5137,7 @@ async def test_long_running_not_in_occupancy(c, s, a, raise_exception):
     assert s.total_occupancy == 0
     assert ws.occupancy == 0
 
-    s.reevaluate_occupancy(0)
+    s._ongoing_background_tasks.call_soon(s.reevaluate_occupancy, 0)
     assert s.workers[a.address].occupancy == 0
     await l.release()
 
@@ -7267,7 +7270,9 @@ def test_print_simple(capsys):
     assert "Hello!:123" in out
 
 
-def _verify_cluster_dump(url, format: str, addresses: set[str]) -> dict:
+def _verify_cluster_dump(
+    url: str | pathlib.PosixPath, format: str, addresses: set[str]
+) -> dict:
     fsspec = pytest.importorskip("fsspec")  # for load_cluster_dump
     url = str(url) + (".msgpack.gz" if format == "msgpack" else ".yaml")
     state = load_cluster_dump(url)
@@ -7280,9 +7285,7 @@ def _verify_cluster_dump(url, format: str, addresses: set[str]) -> dict:
     return state
 
 
-def test_dump_cluster_state_write_from_scheduler(
-    c, s, a, b, tmp_path, monkeypatch: pytest.MonkeyPatch
-):
+def test_dump_cluster_state_write_from_scheduler(c, s, a, b, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     scheduler_dir = tmp_path / "scheduler"
@@ -7515,6 +7518,7 @@ if __name__ == "__main__":
 """
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("processes", [True, False])
 def test_quiet_close_process(processes, tmp_path):
     with open(tmp_path / "script.py", mode="w") as f:

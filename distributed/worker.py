@@ -26,7 +26,7 @@ from concurrent.futures import Executor
 from contextlib import suppress
 from datetime import timedelta
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 
 from tlz import first, keymap, pluck
 from tornado.ioloop import IOLoop, PeriodicCallback
@@ -84,6 +84,7 @@ from distributed.utils import (
     has_arg,
     import_file,
     in_async_call,
+    is_python_shutting_down,
     iscoroutinefunction,
     json_load_robust,
     key_split,
@@ -135,10 +136,16 @@ from distributed.worker_state_machine import (
 from distributed.worker_state_machine import logger as wsm_logger
 
 if TYPE_CHECKING:
+    # FIXME import from typing (needs Python >=3.10)
+    from typing_extensions import ParamSpec
+
+    # Circular imports
     from distributed.client import Client
     from distributed.diagnostics.plugin import WorkerPlugin
     from distributed.nanny import Nanny
 
+    P = ParamSpec("P")
+    T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -160,16 +167,16 @@ WORKER_ANY_RUNNING = {
 }
 
 
-def fail_hard(method):
+def fail_hard(method: Callable[P, T]) -> Callable[P, T]:
     """
     Decorator to close the worker if this method encounters an exception.
     """
     if iscoroutinefunction(method):
 
         @functools.wraps(method)
-        async def wrapper(self, *args, **kwargs):
+        async def wrapper(self, *args: P.args, **kwargs: P.kwargs) -> Any:
             try:
-                return await method(self, *args, **kwargs)
+                return await method(self, *args, **kwargs)  # type: ignore
             except Exception as e:
                 if self.status not in (Status.closed, Status.closing):
                     self.log_event("worker-fail-hard", error_message(e))
@@ -180,7 +187,7 @@ def fail_hard(method):
     else:
 
         @functools.wraps(method)
-        def wrapper(self, *args, **kwargs):
+        def wrapper(self, *args: P.args, **kwargs: P.kwargs) -> T:
             try:
                 return method(self, *args, **kwargs)
             except Exception as e:
@@ -190,7 +197,7 @@ def fail_hard(method):
                 self.loop.add_callback(_force_close, self)
                 raise
 
-    return wrapper
+    return wrapper  # type: ignore
 
 
 async def _force_close(self):
@@ -473,7 +480,14 @@ class Worker(BaseWorker, ServerNode):
         memory_limit: str | float = "auto",
         # Allow overriding the dict-like that stores the task outputs.
         # This is meant for power users only. See WorkerMemoryManager for details.
-        data=None,
+        data: (
+            MutableMapping[str, Any]  # pre-initialised
+            | Callable[[], MutableMapping[str, Any]]  # constructor
+            | tuple[
+                Callable[..., MutableMapping[str, Any]], dict[str, Any]
+            ]  # (constructor, kwargs to constructor)
+            | None  # create internally
+        ) = None,
         # Deprecated parameters; please use dask config instead.
         memory_target_fraction: float | Literal[False] | None = None,
         memory_spill_fraction: float | Literal[False] | None = None,
@@ -548,7 +562,9 @@ class Worker(BaseWorker, ServerNode):
         self._setup_logging(logger, wsm_logger)
 
         if local_dir is not None:
-            warnings.warn("The local_dir keyword has moved to local_directory")
+            warnings.warn(  # type: ignore[unreachable]
+                "The local_dir keyword has moved to local_directory"
+            )
             local_directory = local_dir
 
         if not local_directory:
@@ -559,7 +575,7 @@ class Worker(BaseWorker, ServerNode):
 
         with warn_on_duration(
             "1s",
-            "Creating scratch directories is taking a surprisingly long time. "
+            "Creating scratch directories is taking a surprisingly long time. ({duration:.2f}s) "
             "This is often due to running workers on a network file system. "
             "Consider specifying a local-directory to point workers to write "
             "scratch data to a local disk.",
@@ -844,8 +860,7 @@ class Worker(BaseWorker, ServerNode):
     comm_nbytes = DeprecatedWorkerStateAttribute()
     comm_threshold_bytes = DeprecatedWorkerStateAttribute()
     constrained = DeprecatedWorkerStateAttribute()
-    data_needed = DeprecatedWorkerStateAttribute()
-    data_needed_per_worker = DeprecatedWorkerStateAttribute()
+    data_needed_per_worker = DeprecatedWorkerStateAttribute(target="data_needed")
     executed_count = DeprecatedWorkerStateAttribute()
     executing_count = DeprecatedWorkerStateAttribute()
     generation = DeprecatedWorkerStateAttribute()
@@ -867,6 +882,15 @@ class Worker(BaseWorker, ServerNode):
     validate = DeprecatedWorkerStateAttribute()
     validate_task = DeprecatedWorkerStateAttribute()
     waiting_for_data_count = DeprecatedWorkerStateAttribute()
+
+    @property
+    def data_needed(self) -> set[TaskState]:
+        warnings.warn(
+            "The `Worker.data_needed` attribute has been removed; "
+            "use `Worker.state.data_needed[address]`",
+            FutureWarning,
+        )
+        return {ts for tss in self.state.data_needed.values() for ts in tss}
 
     ##################
     # Administrative #
@@ -909,17 +933,24 @@ class Worker(BaseWorker, ServerNode):
         return self.executors["default"]
 
     @ServerNode.status.setter  # type: ignore
-    def status(self, value):
+    def status(self, value: Status) -> None:
         """Override Server.status to notify the Scheduler of status changes.
         Also handles pausing/unpausing.
         """
         prev_status = self.status
-        ServerNode.status.__set__(self, value)
+        if prev_status == value:
+            return
+
+        ServerNode.status.__set__(self, value)  # type: ignore
         stimulus_id = f"worker-status-change-{time()}"
         self._send_worker_status_change(stimulus_id)
+
         if prev_status == Status.running:
             self.handle_stimulus(PauseEvent(stimulus_id=stimulus_id))
-        elif value == Status.running:
+        elif value == Status.running and prev_status in (
+            Status.paused,
+            Status.closing_gracefully,
+        ):
             self.handle_stimulus(UnpauseEvent(stimulus_id=stimulus_id))
 
     def _send_worker_status_change(self, stimulus_id: str) -> None:
@@ -1079,6 +1110,7 @@ class Worker(BaseWorker, ServerNode):
                         metrics=await self.get_metrics(),
                         extra=await self.get_startup_information(),
                         stimulus_id=f"worker-connect-{time()}",
+                        server_id=self.id,
                     ),
                     serializers=["msgpack"],
                 )
@@ -1119,7 +1151,7 @@ class Worker(BaseWorker, ServerNode):
         self.periodic_callbacks["heartbeat"].start()
         self.loop.add_callback(self.handle_scheduler, comm)
 
-    def _update_latency(self, latency) -> None:
+    def _update_latency(self, latency: float) -> None:
         self.latency = latency * 0.05 + self.latency * 0.95
         if self.digests is not None:
             self.digests["latency"].add(latency)
@@ -1518,21 +1550,31 @@ class Worker(BaseWorker, ServerNode):
             if executor is utils._offload_executor:
                 continue  # Never shutdown the offload executor
 
-            def _close():
+            def _close(wait):
                 if isinstance(executor, ThreadPoolExecutor):
                     executor._work_queue.queue.clear()
-                    executor.shutdown(wait=executor_wait, timeout=timeout)
+                    executor.shutdown(wait=wait, timeout=timeout)
                 else:
-                    executor.shutdown(wait=executor_wait)
+                    executor.shutdown(wait=wait)
 
             # Waiting for the shutdown can block the event loop causing
             # weird deadlocks particularly if the task that is executing in
             # the thread is waiting for a server reply, e.g. when using
             # worker clients, semaphores, etc.
-            try:
-                await to_thread(_close)
-            except RuntimeError:  # Are we shutting down the process?
-                _close()  # Just run it directly
+            if is_python_shutting_down():
+                # If we're shutting down there is no need to wait for daemon
+                # threads to finish
+                _close(wait=False)
+            else:
+                try:
+                    await to_thread(_close, wait=executor_wait)
+                except RuntimeError:  # Are we shutting down the process?
+                    logger.error(
+                        "Could not close executor %r by dispatching to thread. Trying synchronously.",
+                        executor,
+                        exc_info=True,
+                    )
+                    _close(wait=executor_wait)  # Just run it directly
 
         self.stop()
         await self.rpc.close()
@@ -1593,7 +1635,7 @@ class Worker(BaseWorker, ServerNode):
 
                 bcomm.start(comm)
 
-            self.loop.add_callback(batched_send_connect)
+            self._ongoing_background_tasks.call_soon(batched_send_connect)
 
         self.stream_comms[address].send(msg)
 
@@ -1699,7 +1741,7 @@ class Worker(BaseWorker, ServerNode):
         self,
         data: dict[str, object],
         report: bool = True,
-        stimulus_id: str = None,
+        stimulus_id: str | None = None,
     ) -> dict[str, Any]:
         self.handle_stimulus(
             UpdateDataEvent(
@@ -1818,7 +1860,7 @@ class Worker(BaseWorker, ServerNode):
         super()._handle_stimulus_from_task(task)
 
     @fail_hard
-    def handle_stimulus(self, stim: StateMachineEvent) -> None:
+    def handle_stimulus(self, *stims: StateMachineEvent) -> None:
         """Override BaseWorker method for added validation
 
         See also
@@ -1827,7 +1869,7 @@ class Worker(BaseWorker, ServerNode):
         distributed.worker_state_machine.WorkerState.handle_stimulus
         """
         try:
-            super().handle_stimulus(stim)
+            super().handle_stimulus(*stims)
         except Exception as e:
             if hasattr(e, "to_event"):
                 topic, msg = e.to_event()  # type: ignore
@@ -1873,7 +1915,7 @@ class Worker(BaseWorker, ServerNode):
         self,
         start: float,
         stop: float,
-        data: dict[str, Any],
+        data: dict[str, object],
         cause: TaskState,
         worker: str,
     ) -> None:
@@ -2194,7 +2236,7 @@ class Worker(BaseWorker, ServerNode):
                 )
 
             if isinstance(result["actual-exception"], Reschedule):
-                return RescheduleEvent(key=ts.key, stimulus_id=stimulus_id)
+                return RescheduleEvent(key=ts.key, stimulus_id=f"reschedule-{time()}")
 
             logger.warning(
                 "Compute Failed\n"
@@ -3028,7 +3070,7 @@ async def run(server, comm, function, args=(), kwargs=None, wait=True):
             if wait:
                 result = await function(*args, **kwargs)
             else:
-                server.loop.add_callback(function, *args, **kwargs)
+                server._ongoing_background_tasks.call_soon(function, *args, **kwargs)
                 result = None
 
     except Exception as e:

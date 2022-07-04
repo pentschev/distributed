@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Iterator
 from contextlib import contextmanager
 from time import sleep
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
-from distributed import Event, Nanny, Scheduler, Worker, wait
+from distributed import Event, Lock, Nanny, wait
 from distributed.active_memory_manager import (
     ActiveMemoryManagerExtension,
     ActiveMemoryManagerPolicy,
@@ -21,14 +22,16 @@ from distributed.utils_test import (
     captured_logger,
     gen_cluster,
     inc,
+    lock_inc,
     slowinc,
+    wait_for_state,
 )
 
 NO_AMM_START = {"distributed.scheduler.active-memory-manager.start": False}
 
 
 @contextmanager
-def assert_amm_log(expect: list[str]):
+def assert_amm_log(expect: list[str]) -> Iterator[None]:
     with captured_logger(
         "distributed.active_memory_manager", level=logging.DEBUG
     ) as logger:
@@ -84,7 +87,7 @@ def demo_config(
     candidates: list[int] | None = None,
     start: bool = False,
     interval: float = 0.1,
-):
+) -> dict[str, Any]:
     """Create a dask config for AMM with DemoPolicy"""
     return {
         "distributed.scheduler.active-memory-manager.start": start,
@@ -445,7 +448,6 @@ async def test_drop_prefers_paused_workers(c, s, *workers):
     assert ws not in ts.who_has
 
 
-@pytest.mark.slow
 @gen_cluster(client=True, config=demo_config("drop"))
 async def test_drop_with_paused_workers_with_running_tasks_1(c, s, a, b):
     """If there is exactly 1 worker that holds a replica of a task that isn't paused or
@@ -456,17 +458,18 @@ async def test_drop_with_paused_workers_with_running_tasks_1(c, s, a, b):
     a is paused and with dependent tasks executing on it
     b is running and has no dependent tasks
     """
-    x = (await c.scatter({"x": 1}, broadcast=True))["x"]
-    y = c.submit(slowinc, x, delay=2.5, key="y", workers=[a.address])
+    lock = Lock()
+    async with lock:
+        x = (await c.scatter({"x": 1}, broadcast=True))["x"]
+        y = c.submit(lock_inc, x, lock=lock, key="y", workers=[a.address])
+        await wait_for_state("y", "executing", a)
 
-    while "y" not in a.state.tasks or a.state.tasks["y"].state != "executing":
-        await asyncio.sleep(0.01)
-    a.status = Status.paused
-    while s.workers[a.address].status != Status.paused:
-        await asyncio.sleep(0.01)
-    assert a.state.tasks["y"].state == "executing"
+        a.status = Status.paused
+        while s.workers[a.address].status != Status.paused:
+            await asyncio.sleep(0.01)
+        assert a.state.tasks["y"].state == "executing"
 
-    s.extensions["amm"].run_once()
+        s.extensions["amm"].run_once()
     await y
     assert len(s.tasks["x"].who_has) == 2
 
@@ -491,7 +494,6 @@ async def test_drop_with_paused_workers_with_running_tasks_2(c, s, a, b):
     assert {ws.address for ws in s.tasks["x"].who_has} == {b.address}
 
 
-@pytest.mark.slow
 @pytest.mark.parametrize("pause", [True, False])
 @gen_cluster(client=True, config=demo_config("drop"))
 async def test_drop_with_paused_workers_with_running_tasks_3_4(c, s, a, b, pause):
@@ -507,26 +509,26 @@ async def test_drop_with_paused_workers_with_running_tasks_3_4(c, s, a, b, pause
     a is running and with dependent tasks executing on it
     b is running and has no dependent tasks
     """
-    x = (await c.scatter({"x": 1}, broadcast=True))["x"]
-    y = c.submit(slowinc, x, delay=2.5, key="y", workers=[a.address])
-    while "y" not in a.state.tasks or a.state.tasks["y"].state != "executing":
-        await asyncio.sleep(0.01)
+    lock = Lock()
+    async with lock:
+        x = (await c.scatter({"x": 1}, broadcast=True))["x"]
+        y = c.submit(lock_inc, x, lock, key="y", workers=[a.address])
+        await wait_for_state("y", "executing", a)
 
-    if pause:
-        a.status = Status.paused
-        b.status = Status.paused
-        while any(ws.status != Status.paused for ws in s.workers.values()):
-            await asyncio.sleep(0.01)
+        if pause:
+            a.status = Status.paused
+            b.status = Status.paused
+            while any(ws.status != Status.paused for ws in s.workers.values()):
+                await asyncio.sleep(0.01)
 
-    assert s.tasks["y"].state == "processing"
-    assert a.state.tasks["y"].state == "executing"
+        assert s.tasks["y"].state == "processing"
+        assert a.state.tasks["y"].state == "executing"
 
-    s.extensions["amm"].run_once()
+        s.extensions["amm"].run_once()
     await y
     assert {ws.address for ws in s.tasks["x"].who_has} == {a.address}
 
 
-@pytest.mark.slow
 @gen_cluster(client=True, nthreads=[("", 1)] * 3, config=demo_config("drop"))
 async def test_drop_with_paused_workers_with_running_tasks_5(c, s, w1, w2, w3):
     """If there is exactly 1 worker that holds a replica of a task that isn't paused or
@@ -538,29 +540,31 @@ async def test_drop_with_paused_workers_with_running_tasks_5(c, s, w1, w2, w3):
     w2 is running and has no dependent tasks
     w3 is running and with dependent tasks executing on it
     """
-    x = (await c.scatter({"x": 1}, broadcast=True))["x"]
-    y1 = c.submit(slowinc, x, delay=2.5, key="y1", workers=[w1.address])
-    y2 = c.submit(slowinc, x, delay=2.5, key="y2", workers=[w3.address])
+    lock = Lock()
+    async with lock:
+        x = (await c.scatter({"x": 1}, broadcast=True))["x"]
+        y1 = c.submit(lock_inc, x, lock=lock, key="y1", workers=[w1.address])
+        y2 = c.submit(lock_inc, x, lock=lock, key="y2", workers=[w3.address])
 
-    def executing() -> bool:
-        return (
-            "y1" in w1.state.tasks
-            and w1.state.tasks["y1"].state == "executing"
-            and "y2" in w3.state.tasks
-            and w3.state.tasks["y2"].state == "executing"
-        )
+        def executing() -> bool:
+            return (
+                "y1" in w1.state.tasks
+                and w1.state.tasks["y1"].state == "executing"
+                and "y2" in w3.state.tasks
+                and w3.state.tasks["y2"].state == "executing"
+            )
 
-    while not executing():
-        await asyncio.sleep(0.01)
-    w1.status = Status.paused
-    while s.workers[w1.address].status != Status.paused:
-        await asyncio.sleep(0.01)
-    assert executing()
+        while not executing():
+            await asyncio.sleep(0.01)
+        w1.status = Status.paused
+        while s.workers[w1.address].status != Status.paused:
+            await asyncio.sleep(0.01)
+        assert executing()
 
-    s.extensions["amm"].run_once()
-    while {ws.address for ws in s.tasks["x"].who_has} != {w1.address, w3.address}:
-        await asyncio.sleep(0.01)
-    assert executing()
+        s.extensions["amm"].run_once()
+        while {ws.address for ws in s.tasks["x"].who_has} != {w1.address, w3.address}:
+            await asyncio.sleep(0.01)
+        assert executing()
 
 
 @gen_cluster(nthreads=[("", 1)] * 4, client=True, config=demo_config("replicate", n=2))
@@ -913,19 +917,20 @@ async def test_RetireWorker_all_recipients_are_paused(c, s, a, b):
 @gen_cluster(
     client=True,
     config={
-        "distributed.scheduler.active-memory-manager.start": True,  # to avoid one-off AMM instance
+        # Don't use one-off AMM instance
+        "distributed.scheduler.active-memory-manager.start": True,
         "distributed.scheduler.active-memory-manager.policies": [],
     },
     timeout=15,
 )
-async def test_RetireWorker_new_keys_arrive_after_all_keys_moved_away(
-    c, s: Scheduler, a: Worker, b: Worker
-):
+async def test_RetireWorker_new_keys_arrive_after_all_keys_moved_away(c, s, a, b):
     """
-    If all keys have been moved off a worker, but then new keys arrive (due to task completion or `gather_dep`)
-    before the worker has actually closed, make sure we still retire it (instead of hanging forever).
+    If all keys have been moved off a worker, but then new keys arrive (due to task
+    completion or `gather_dep`) before the worker has actually closed, make sure we
+    still retire it (instead of hanging forever).
 
-    This test is timing-sensitive. If it runs too slowly, it *should* `pytest.skip` itself.
+    This test is timing-sensitive. If it runs too slowly, it *should* `pytest.skip`
+    itself.
 
     See https://github.com/dask/distributed/issues/6223 for motivation.
     """
@@ -945,11 +950,7 @@ async def test_RetireWorker_new_keys_arrive_after_all_keys_moved_away(
         allow_other_workers=True,
         key="extra",
     )
-
-    while (
-        extra.key not in a.state.tasks or a.state.tasks[extra.key].state != "executing"
-    ):
-        await asyncio.sleep(0.01)
+    await wait_for_state(extra.key, "executing", a)
 
     t = asyncio.create_task(c.retire_workers([a.address]))
 
