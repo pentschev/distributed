@@ -6,6 +6,7 @@ import importlib
 import logging
 import os
 import sys
+import tempfile
 import threading
 import traceback
 import warnings
@@ -32,6 +33,7 @@ from distributed import (
     Client,
     Event,
     Nanny,
+    WorkerPlugin,
     default_client,
     get_client,
     get_worker,
@@ -47,6 +49,7 @@ from distributed.metrics import time
 from distributed.protocol import pickle
 from distributed.scheduler import Scheduler
 from distributed.utils_test import (
+    BlockedExecute,
     BlockedGatherDep,
     BlockedGetData,
     TaskStateMetadataPlugin,
@@ -739,7 +742,7 @@ async def test_restrictions(c, s, a, b):
 @gen_cluster(client=True)
 async def test_clean_nbytes(c, s, a, b):
     L = [delayed(inc)(i) for i in range(10)]
-    for i in range(5):
+    for _ in range(5):
         L = [delayed(add)(x, y) for x, y in sliding_window(2, L)]
     total = delayed(sum)(L)
 
@@ -934,25 +937,27 @@ async def test_heartbeats(c, s, a, b):
 
 
 @pytest.mark.parametrize("worker", [Worker, Nanny])
-def test_worker_dir(worker):
-    with tmpfile() as fn:
+def test_worker_dir(worker, tmpdir):
+    @gen_cluster(client=True, worker_kwargs={"local_directory": str(tmpdir)})
+    async def test_worker_dir(c, s, a, b):
+        directories = [w.local_directory for w in s.workers.values()]
+        assert all(d.startswith(str(tmpdir)) for d in directories)
+        assert len(set(directories)) == 2  # distinct
 
-        @gen_cluster(client=True, worker_kwargs={"local_directory": fn})
-        async def test_worker_dir(c, s, a, b):
-            directories = [w.local_directory for w in s.workers.values()]
-            assert all(d.startswith(fn) for d in directories)
-            assert len(set(directories)) == 2  # distinct
-
-        test_worker_dir()
+    test_worker_dir()
 
 
-@gen_cluster(nthreads=[], config={"temporary-directory": None})
-async def test_false_worker_dir(s):
-    async with Worker(s.address, local_directory="") as w:
-        local_directory = w.local_directory
+@gen_cluster(client=True, nthreads=[], config={"temporary-directory": None})
+async def test_default_worker_dir(c, s):
+    expect = os.path.join(tempfile.gettempdir(), "dask-worker-space")
 
-    cwd = os.getcwd()
-    assert os.path.dirname(local_directory) == os.path.join(cwd, "dask-worker-space")
+    async with Worker(s.address) as w:
+        assert os.path.dirname(w.local_directory) == expect
+
+    async with Nanny(s.address) as n:
+        assert n.local_directory == expect
+        results = await c.run(lambda dask_worker: dask_worker.local_directory)
+        assert os.path.dirname(results[n.worker_address]) == expect
 
 
 @gen_cluster(client=True)
@@ -1014,7 +1019,11 @@ def test_get_client_sync(client):
 @gen_cluster(client=True)
 async def test_get_client_coroutine(c, s, a, b):
     async def f():
-        client = await get_client()
+        # TODO: the existence of `await get_client()` implies the possibility
+        # of `async with get_client()` and that will kill the workers' client
+        # if you do that. We really don't want users to do that.
+        # https://github.com/dask/distributed/pull/6921/
+        client = get_client()
         future = client.submit(inc, 10)
         result = await future
         return result
@@ -1220,9 +1229,8 @@ def test_get_worker_name(client):
 @gen_cluster(nthreads=[], client=True)
 async def test_scheduler_address_config(c, s):
     with dask.config.set({"scheduler-address": s.address}):
-        worker = await Worker()
-        assert worker.scheduler.address == s.address
-    await worker.close()
+        async with Worker() as w:
+            assert w.scheduler.address == s.address
 
 
 @pytest.mark.xfail(reason="very high flakiness")
@@ -1314,10 +1322,9 @@ async def test_register_worker_callbacks(c, s, a, b):
     assert list(result.values()) == [False] * 2
 
     # Start a worker and check that startup is not run
-    worker = await Worker(s.address)
-    result = await c.run(test_import, workers=[worker.address])
-    assert list(result.values()) == [False]
-    await worker.close()
+    async with Worker(s.address) as worker:
+        result = await c.run(test_import, workers=[worker.address])
+        assert list(result.values()) == [False]
 
     # Add a plugin function
     response = await c.register_worker_callbacks(setup=mystartup)
@@ -1327,11 +1334,10 @@ async def test_register_worker_callbacks(c, s, a, b):
     result = await c.run(test_import)
     assert list(result.values()) == [True] * 2
 
-    # Start a worker and check it is ran on it
-    worker = await Worker(s.address)
-    result = await c.run(test_import, workers=[worker.address])
-    assert list(result.values()) == [True]
-    await worker.close()
+    # Start a worker and check it is run on it
+    async with Worker(s.address) as worker:
+        result = await c.run(test_import, workers=[worker.address])
+        assert list(result.values()) == [True]
 
     # Register another plugin function
     response = await c.register_worker_callbacks(setup=mystartup2)
@@ -1341,13 +1347,12 @@ async def test_register_worker_callbacks(c, s, a, b):
     result = await c.run(test_startup2)
     assert list(result.values()) == [True] * 2
 
-    # Start a worker and check it is ran on it
-    worker = await Worker(s.address)
-    result = await c.run(test_import, workers=[worker.address])
-    assert list(result.values()) == [True]
-    result = await c.run(test_startup2, workers=[worker.address])
-    assert list(result.values()) == [True]
-    await worker.close()
+    # Start a worker and check it is run on it
+    async with Worker(s.address) as worker:
+        result = await c.run(test_import, workers=[worker.address])
+        assert list(result.values()) == [True]
+        result = await c.run(test_startup2, workers=[worker.address])
+        assert list(result.values()) == [True]
 
 
 @gen_cluster(client=True)
@@ -1357,19 +1362,17 @@ async def test_register_worker_callbacks_err(c, s, a, b):
 
 
 @gen_cluster(nthreads=[])
-async def test_local_directory(s):
-    with tmpfile() as fn:
-        with dask.config.set(temporary_directory=fn):
-            w = await Worker(s.address)
-            assert w.local_directory.startswith(fn)
+async def test_local_directory(s, tmp_path):
+    with dask.config.set(temporary_directory=str(tmp_path)):
+        async with Worker(s.address) as w:
+            assert w.local_directory.startswith(str(tmp_path))
             assert "dask-worker-space" in w.local_directory
 
 
 @gen_cluster(nthreads=[])
-async def test_local_directory_make_new_directory(s):
-    with tmpfile() as fn:
-        w = await Worker(s.address, local_directory=os.path.join(fn, "foo", "bar"))
-        assert w.local_directory.startswith(fn)
+async def test_local_directory_make_new_directory(s, tmp_path):
+    async with Worker(s.address, local_directory=str(tmp_path / "foo" / "bar")) as w:
+        assert w.local_directory.startswith(str(tmp_path))
         assert "foo" in w.local_directory
         assert "dask-worker-space" in w.local_directory
 
@@ -1377,14 +1380,12 @@ async def test_local_directory_make_new_directory(s):
 @pytest.mark.skipif(not LINUX, reason="Need 127.0.0.2 to mean localhost")
 @gen_cluster(nthreads=[], client=True)
 async def test_host_address(c, s):
-    w = await Worker(s.address, host="127.0.0.2")
-    assert "127.0.0.2" in w.address
-    await w.close()
+    async with Worker(s.address, host="127.0.0.2") as w:
+        assert "127.0.0.2" in w.address
 
-    n = await Nanny(s.address, host="127.0.0.3")
-    assert "127.0.0.3" in n.address
-    assert "127.0.0.3" in n.worker_address
-    await n.close()
+    async with Nanny(s.address, host="127.0.0.3") as n:
+        assert "127.0.0.3" in n.address
+        assert "127.0.0.3" in n.worker_address
 
 
 @pytest.mark.parametrize("Worker", [Worker, Nanny])
@@ -1617,13 +1618,13 @@ async def test_bad_metrics(s):
 
 @gen_cluster(nthreads=[])
 async def test_bad_startup(s):
+    """Bad startup functions do not cause the Worker to fail"""
+
     def bad_startup(w):
         raise Exception("Hello")
 
-    try:
-        await Worker(s.address, startup_information={"bad": bad_startup})
-    except Exception:
-        pytest.fail("Startup exception was raised")
+    async with Worker(s.address, startup_information={"bad": bad_startup}):
+        pass
 
 
 @gen_cluster(client=True)
@@ -1675,7 +1676,7 @@ async def test_pip_install_fails(c, s, a, b):
 
 @gen_cluster(nthreads=[])
 async def test_update_latency(s):
-    async with await Worker(s.address) as w:
+    async with Worker(s.address) as w:
         original = w.latency
         await w.heartbeat()
         assert original != w.latency
@@ -1720,7 +1721,7 @@ async def test_heartbeat_comm_closed(s, monkeypatch):
         def bad_heartbeat_worker(*args, **kwargs):
             raise CommClosedError()
 
-        async with await Worker(s.address) as w:
+        async with Worker(s.address) as w:
             # Trigger CommClosedError during worker heartbeat
             monkeypatch.setattr(w.scheduler, "heartbeat_worker", bad_heartbeat_worker)
 
@@ -1828,7 +1829,7 @@ async def test_bad_local_directory(s):
 
 @gen_cluster(client=True, nthreads=[])
 async def test_taskstate_metadata(c, s):
-    async with await Worker(s.address) as a:
+    async with Worker(s.address) as a:
         await c.register_worker_plugin(TaskStateMetadataPlugin())
 
         f = c.submit(inc, 1)
@@ -3295,41 +3296,6 @@ async def test_gather_dep_no_longer_in_flight_tasks(c, s, a):
         assert not any("missing-dep" in msg for msg in f2_story)
 
 
-@pytest.mark.parametrize("intermediate_state", ["resumed", "cancelled"])
-@pytest.mark.parametrize("close_worker", [False, True])
-@gen_cluster(client=True, config={"distributed.comm.timeouts.connect": "500ms"})
-async def test_deadlock_cancelled_after_inflight_before_gather_from_worker(
-    c, s, a, x, intermediate_state, close_worker
-):
-    """If a task was transitioned to in-flight, the gather-dep coroutine was
-    scheduled but a cancel request came in before gather_data_from_worker was
-    issued this might corrupt the state machine if the cancelled key is not
-    properly handled
-    """
-    fut1 = c.submit(slowinc, 1, workers=[a.address], key="f1")
-    fut1B = c.submit(slowinc, 2, workers=[x.address], key="f1B")
-    fut2 = c.submit(sum, [fut1, fut1B], workers=[x.address], key="f2")
-    await fut2
-
-    async with BlockedGatherDep(s.address, name="b") as b:
-        fut3 = c.submit(inc, fut2, workers=[b.address], key="f3")
-
-        await wait_for_state(fut2.key, "flight", b)
-
-        s.set_restrictions(worker={fut1B.key: a.address, fut2.key: b.address})
-
-        await b.in_gather_dep.wait()
-
-        await s.remove_worker(
-            address=x.address, safe=True, close=close_worker, stimulus_id="test"
-        )
-
-        await wait_for_state(fut2.key, intermediate_state, b, interval=0)
-
-        b.block_gather_dep.set()
-        await fut3
-
-
 @gen_cluster(client=True, nthreads=[("", 1)])
 async def test_Worker__to_dict(c, s, a):
     x = c.submit(inc, 1, key="x")
@@ -3358,9 +3324,11 @@ async def test_Worker__to_dict(c, s, a):
         "nthreads",
         "running",
         "ready",
+        "has_what",
         "constrained",
         "executing",
         "long_running",
+        "missing_dep_flight",
         "in_flight_tasks",
         "in_flight_workers",
         "busy_workers",
@@ -3511,3 +3479,75 @@ async def test_reconnect_argument_deprecated(s):
         warnings.simplefilter("error")
         async with Worker(s.address):
             pass
+
+
+@gen_cluster(client=True, nthreads=[])
+async def test_worker_running_before_running_plugins(c, s, caplog):
+    class InitWorkerNewThread(WorkerPlugin):
+        name: str = "init_worker_new_thread"
+        setup_status: Status | None = None
+
+        def setup(self, worker):
+            self.setup_status = worker.status
+
+        def teardown(self, worker):
+            pass
+
+    await c.register_worker_plugin(InitWorkerNewThread())
+    async with Worker(s.address) as worker:
+        assert await c.submit(inc, 1) == 2
+        assert worker.plugins[InitWorkerNewThread.name].setup_status is Status.running
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[],
+    config={
+        # This is just to make Scheduler.retire_worker more reactive to changes
+        "distributed.scheduler.active-memory-manager.start": True,
+        "distributed.scheduler.active-memory-manager.interval": "50ms",
+    },
+)
+async def test_execute_preamble_abort_retirement(c, s):
+    """Test race condition in the preamble of Worker.execute(), which used to cause a
+    task to remain permanently in executing state in case of very tight timings when
+    exiting the closing_gracefully status.
+
+    See also
+    --------
+    https://github.com/dask/distributed/issues/6867
+    test_cancelled_state.py::test_execute_preamble_early_cancel
+    """
+    async with BlockedExecute(s.address) as a:
+        await c.wait_for_workers(1)
+        a.block_deserialize_task.set()  # Uninteresting in this test
+
+        x = await c.scatter({"x": 1}, workers=[a.address])
+        y = c.submit(inc, 1, key="y", workers=[a.address])
+        await a.in_execute.wait()
+
+        async with BlockedGatherDep(s.address) as b:
+            await c.wait_for_workers(2)
+            retire_fut = asyncio.create_task(c.retire_workers([a.address]))
+            while a.status != Status.closing_gracefully:
+                await asyncio.sleep(0.01)
+            # The Active Memory Manager will send to b the message
+            # {op: acquire-replicas, who_has: {x: [a.address]}}
+            await b.in_gather_dep.wait()
+
+            # Run Worker.execute. At the moment of writing this test, the method would
+            # detect the closing_gracefully status and perform an early exit.
+            a.block_execute.set()
+            await a.in_execute_exit.wait()
+
+        # b has shut down. There's nowhere to replicate x to anymore, so retire_workers
+        # will give up and reinstate a to running status.
+        assert await retire_fut == {}
+        while a.status != Status.running:
+            await asyncio.sleep(0.01)
+
+        # Finally let the done_callback of Worker.execute run
+        a.block_execute_exit.set()
+
+        # Test that y does not get stuck.
+        assert await y == 2
