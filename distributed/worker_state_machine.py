@@ -4,6 +4,7 @@ import abc
 import asyncio
 import heapq
 import logging
+import math
 import operator
 import random
 import sys
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from distributed.worker import Worker
 
     # TODO move out of TYPE_CHECKING (requires Python >=3.10)
+    # Not to be confused with distributed.scheduler.TaskStateState
     TaskStateState: TypeAlias = Literal[
         "cancelled",
         "constrained",
@@ -237,9 +239,10 @@ class TaskState:
 
     #: The current state of the task
     state: TaskStateState = "released"
-    #: The previous state of the task. It is not None iff state in (cancelled, resumed).
+    #: The previous state of the task. It is not None iff :attr:`state` in
+    #: (cancelled, resumed).
     previous: Literal["executing", "long-running", "flight", None] = None
-    #: The next state of the task. It is not None iff state == resumed.
+    #: The next state of the task. It is not None iff :attr:`state` == resumed.
     next: Literal["fetch", "waiting", None] = None
 
     #: Expected duration of the task
@@ -277,7 +280,9 @@ class TaskState:
     nbytes: int | None = None
     #: Arbitrary task annotations
     annotations: dict | None = None
-    #: True if the task is in memory or erred; False otherwise
+    #: True if the :meth:`~WorkerBase.execute` or :meth:`~WorkerBase.gather_dep`
+    #: coroutine servicing this task completed; False otherwise. This flag changes
+    #: the behaviour of transitions out of the ``executing``, ``flight`` etc. states.
     done: bool = False
 
     _instances: ClassVar[weakref.WeakSet[TaskState]] = weakref.WeakSet()
@@ -359,8 +364,8 @@ class Instruction:
         :meth:`WorkerState.handle_stimulus` or in :attr:`WorkerState.stimulus_log` vs.
         an expected list of matches.
 
-        Example
-        -------
+        Examples
+        --------
 
         .. code-block:: python
 
@@ -513,7 +518,7 @@ class LongRunningMsg(SendMessageToScheduler):
 
     __slots__ = ("key", "compute_duration")
     key: str
-    compute_duration: float
+    compute_duration: float | None
 
 
 @dataclass
@@ -562,7 +567,10 @@ class StealResponseMsg(SendMessageToScheduler):
 
 @dataclass
 class StateMachineEvent:
+    """Base abstract class for all stimuli that can modify the worker state"""
+
     __slots__ = ("stimulus_id", "handled")
+    #: Unique ID of the event
     stimulus_id: str
     #: timestamp of when the event was handled by the worker
     # TODO Switch to @dataclass(slots=True), uncomment the line below, and remove the
@@ -571,6 +579,7 @@ class StateMachineEvent:
     _classes: ClassVar[dict[str, type[StateMachineEvent]]] = {}
 
     def __new__(cls, *args: Any, **kwargs: Any) -> StateMachineEvent:
+        """Hack to initialize the ``handled`` attribute in Python <3.10"""
         self = object.__new__(cls)
         self.handled = None
         return self
@@ -1014,6 +1023,7 @@ if TYPE_CHECKING:
     # TODO remove quotes (requires Python >=3.9)
     # TODO get out of TYPE_CHECKING (requires Python >=3.10)
     # {TaskState -> finish: TaskStateState | (finish: TaskStateState, transition *args)}
+    # Not to be confused with distributed.scheduler.Recs
     Recs: TypeAlias = "dict[TaskState, TaskStateState | tuple]"
     Instructions: TypeAlias = "list[Instruction]"
     RecsInstrs: TypeAlias = "tuple[Recs, Instructions]"
@@ -1116,20 +1126,21 @@ class WorkerState:
     #: multiple entries in :attr:`~TaskState.who_has` will appear multiple times here.
     data_needed: defaultdict[str, HeapSet[TaskState]]
 
-    #: Number of bytes to fetch from the same worker in a single call to
-    #: :meth:`BaseWorker.gather_dep`. Multiple small tasks that can be fetched from the
-    #: same worker will be clustered in a single instruction as long as their combined
-    #: size doesn't exceed this value.
-    target_message_size: int
+    #: Number of bytes to gather from the same worker in a single call to
+    #: :meth:`BaseWorker.gather_dep`. Multiple small tasks that can be gathered from the
+    #: same worker will be batched in a single instruction as long as their combined
+    #: size doesn't exceed this value. If the first task to be gathered exceeds this
+    # limit, it will still be gathered to ensure progress. Hence, this limit is not absolute.
+    transfer_message_bytes_limit: float
 
     #: All and only tasks with ``TaskState.state == 'missing'``.
     missing_dep_flight: set[TaskState]
 
-    #: Which tasks that are coming to us in current peer-to-peer connections.
-    #: This set includes exclusively:
-    #: - tasks with :attr:`state` == 'flight'
-    #: - tasks with :attr:`state` in ('cancelled', 'resumed') and
-    #:   :attr:`previous` == 'flight`
+    #: Tasks that are coming to us in current peer-to-peer connections.
+    #:
+    #: This set includes exclusively tasks with :attr:`~TaskState.state` == 'flight' as
+    #: well as tasks with :attr:`~TaskState.state` in ('cancelled', 'resumed') and
+    #: :attr:`~TaskState.previous` == 'flight`.
     #:
     #: See also :meth:`in_flight_tasks_count`.
     in_flight_tasks: set[TaskState]
@@ -1140,16 +1151,19 @@ class WorkerState:
     #: dependencies until the current query returns.
     in_flight_workers: dict[str, set[str]]
 
-    #: The total number of bytes in flight
-    comm_nbytes: int
+    #: Current total size of open data transfers from other workers
+    transfer_incoming_bytes: int
 
-    #: The maximum number of concurrent incoming requests for data.
-    #: See also :attr:`distributed.worker.Worker.total_in_connections`.
-    total_out_connections: int
+    #: Maximum number of concurrent incoming data transfers from other workers.
+    #: See also :attr:`distributed.worker.Worker.transfer_outgoing_count_limit`.
+    transfer_incoming_count_limit: int
 
-    #: Ignore :attr:`total_out_connections` as long as :attr:`comm_nbytes` is
+    #: Total number of data transfers from other workers since the worker was started.
+    transfer_incoming_count_total: int
+
+    #: Ignore :attr:`transfer_incoming_count_limit` as long as :attr:`transfer_incoming_bytes` is
     #: less than this value.
-    comm_threshold_bytes: int
+    transfer_incoming_bytes_throttle_threshold: int
 
     #: Peer workers that recently returned a busy status. Workers in this set won't be
     #: asked for additional dependencies for some time.
@@ -1171,10 +1185,10 @@ class WorkerState:
     available_resources: dict[str, float]
 
     #: Set of tasks that are currently running.
-    #: This set includes exclusively:
-    #: - tasks with :attr:`state` == 'executing'
-    #: - tasks with :attr:`state` in ('cancelled', 'resumed') and
-    #:   :attr:`previous` == 'executing`
+    #:
+    #: This set includes exclusively tasks with :attr:`~TaskState.state` == 'executing'
+    #: as well as tasks with :attr:`~TaskState.state` in ('cancelled', 'resumed') and
+    #: :attr:`~TaskState.previous` == 'executing`.
     #:
     #: See also :meth:`executing_count` and :attr:`long_running`.
     executing: set[TaskState]
@@ -1183,16 +1197,19 @@ class WorkerState:
     #: :func:`~distributed.secede`, so they no longer count towards the maximum number
     #: of concurrent tasks (nthreads).
     #: These tasks do not appear in the :attr:`executing` set.
-    #: This set includes exclusively:
-    #: - tasks with :attr:`state` == 'long-running'
-    #: - tasks with :attr:`state` in ('cancelled', 'resumed') and
-    #:   :attr:`previous` == 'long-running`
     #:
+    #: This set includes exclusively tasks with
+    #: :attr:`~TaskState.state` == 'long-running' as well as tasks with
+    #: :attr:`~TaskState.state` in ('cancelled', 'resumed') and
+    #: :attr:`~TaskState.previous` == 'long-running`.
     long_running: set[TaskState]
 
     #: A number of tasks that this worker has run in its lifetime; this includes failed
     #: and cancelled tasks. See also :meth:`executing_count`.
     executed_count: int
+
+    #: Total size of all tasks in memory
+    nbytes: int
 
     #: Actor tasks. See :doc:`actors`.
     actors: dict[str, object]
@@ -1220,6 +1237,9 @@ class WorkerState:
     #: In production, it should always be set to False.
     transition_counter_max: int | Literal[False]
 
+    #: Limit of bytes for incoming data transfers; this is used for throttling.
+    transfer_incoming_bytes_limit: float
+
     #: Statically-seeded random state, used to guarantee determinism whenever a
     #: pseudo-random choice is required
     rng: random.Random
@@ -1235,9 +1255,11 @@ class WorkerState:
         threads: dict[str, int] | None = None,
         plugins: dict[str, WorkerPlugin] | None = None,
         resources: Mapping[str, float] | None = None,
-        total_out_connections: int = 9999,
+        transfer_incoming_count_limit: int = 9999,
         validate: bool = True,
         transition_counter_max: int | Literal[False] = False,
+        transfer_incoming_bytes_limit: float = math.inf,
+        transfer_message_bytes_limit: float = math.inf,
     ):
         self.nthreads = nthreads
 
@@ -1264,22 +1286,25 @@ class WorkerState:
         )
         self.in_flight_workers = {}
         self.busy_workers = set()
-        self.total_out_connections = total_out_connections
-        self.comm_threshold_bytes = int(10e6)
-        self.comm_nbytes = 0
+        self.transfer_incoming_count_limit = transfer_incoming_count_limit
+        self.transfer_incoming_count_total = 0
+        self.transfer_incoming_bytes_throttle_threshold = int(10e6)
+        self.transfer_incoming_bytes = 0
         self.missing_dep_flight = set()
         self.generation = 0
         self.ready = HeapSet(key=operator.attrgetter("priority"))
         self.constrained = HeapSet(key=operator.attrgetter("priority"))
         self.executing = set()
         self.in_flight_tasks = set()
+        self.nbytes = 0
         self.executed_count = 0
         self.long_running = set()
-        self.target_message_size = int(50e6)  # 50 MB
+        self.transfer_message_bytes_limit = transfer_message_bytes_limit
         self.log = deque(maxlen=100_000)
         self.stimulus_log = deque(maxlen=10_000)
         self.transition_counter = 0
         self.transition_counter_max = transition_counter_max
+        self.transfer_incoming_bytes_limit = transfer_incoming_bytes_limit
         self.actors = {}
         self.rng = random.Random(0)
 
@@ -1341,13 +1366,23 @@ class WorkerState:
 
     @property
     def in_flight_tasks_count(self) -> int:
-        """Count of tasks currently being replicated from other workers to this one.
+        """Number of tasks currently being replicated from other workers to this one.
 
         See also
         --------
         WorkerState.in_flight_tasks
         """
         return len(self.in_flight_tasks)
+
+    @property
+    def transfer_incoming_count(self) -> int:
+        """Current number of open data transfers from other workers.
+
+        See also
+        --------
+        WorkerState.in_flight_workers
+        """
+        return len(self.in_flight_workers)
 
     #########################
     # Shared helper methods #
@@ -1445,16 +1480,35 @@ class WorkerState:
         self.long_running.discard(ts)
         self.in_flight_tasks.discard(ts)
 
+    def _should_throttle_incoming_transfers(self) -> bool:
+        """Decides whether the WorkerState should throttle data transfers from other workers.
+
+        Returns
+        -------
+        * True if the number of incoming data transfers reached its limit
+        and the size of incoming data transfers reached the minimum threshold for throttling
+        * True if the size of incoming data transfers reached its limit
+        * False otherwise
+        """
+        reached_count_limit = (
+            self.transfer_incoming_count >= self.transfer_incoming_count_limit
+        )
+        reached_throttle_threshold = (
+            self.transfer_incoming_bytes
+            >= self.transfer_incoming_bytes_throttle_threshold
+        )
+        reached_bytes_limit = (
+            self.transfer_incoming_bytes >= self.transfer_incoming_bytes_limit
+        )
+        return reached_count_limit and reached_throttle_threshold or reached_bytes_limit
+
     def _ensure_communicating(self, *, stimulus_id: str) -> RecsInstrs:
         """Transition tasks from fetch to flight, until there are no more tasks in fetch
         state or a threshold has been reached.
         """
         if not self.running or not self.data_needed:
             return {}, []
-        if (
-            len(self.in_flight_workers) >= self.total_out_connections
-            and self.comm_nbytes >= self.comm_threshold_bytes
-        ):
+        if self._should_throttle_incoming_transfers():
             return {}, []
 
         recommendations: Recs = {}
@@ -1462,10 +1516,15 @@ class WorkerState:
 
         for worker, available_tasks in self._select_workers_for_gather():
             assert worker != self.address
-            to_gather_tasks, total_nbytes = self._select_keys_for_gather(
+            to_gather_tasks, message_nbytes = self._select_keys_for_gather(
                 available_tasks
             )
-            assert to_gather_tasks
+            # We always load at least one task
+            assert to_gather_tasks or self.transfer_incoming_bytes
+            # ...but that task might be selected in the previous iteration of the loop
+            if not to_gather_tasks:
+                break
+
             to_gather_keys = {ts.key for ts in to_gather_tasks}
 
             logger.debug(
@@ -1475,8 +1534,8 @@ class WorkerState:
                 worker,
                 len(available_tasks),
                 len(self.data_needed),
-                len(self.in_flight_workers),
-                self.total_out_connections,
+                self.transfer_incoming_count,
+                self.transfer_incoming_count_limit,
                 len(self.busy_workers),
             )
             self.log.append(
@@ -1492,24 +1551,22 @@ class WorkerState:
 
             # A single invocation of _ensure_communicating may generate up to one
             # GatherDep instruction per worker. Multiple tasks from the same worker may
-            # be clustered in the same instruction by _select_keys_for_gather. But once
+            # be batched in the same instruction by _select_keys_for_gather. But once
             # a worker has been selected for a GatherDep and added to in_flight_workers,
             # it won't be selected again until the gather completes.
             instructions.append(
                 GatherDep(
                     worker=worker,
                     to_gather=to_gather_keys,
-                    total_nbytes=total_nbytes,
+                    total_nbytes=message_nbytes,
                     stimulus_id=stimulus_id,
                 )
             )
 
             self.in_flight_workers[worker] = to_gather_keys
-            self.comm_nbytes += total_nbytes
-            if (
-                len(self.in_flight_workers) >= self.total_out_connections
-                and self.comm_nbytes >= self.comm_threshold_bytes
-            ):
+            self.transfer_incoming_count_total += 1
+            self.transfer_incoming_bytes += message_nbytes
+            if self._should_throttle_incoming_transfers():
                 break
 
         return recommendations, instructions
@@ -1584,23 +1641,61 @@ class WorkerState:
         """Helper of _ensure_communicating.
 
         Fetch all tasks that are replicated on the target worker within a single
-        message, up to target_message_size.
+        message, up to transfer_message_bytes_limit or until we reach the limit
+        for the size of incoming data transfers.
         """
         to_gather: list[TaskState] = []
-        total_nbytes = 0
+        message_nbytes = 0
 
         while available:
             ts = available.peek()
-            # The top-priority task is fetched regardless of its size
-            if to_gather and total_nbytes + ts.get_nbytes() > self.target_message_size:
+            if self._task_exceeds_transfer_limits(ts, message_nbytes):
                 break
             for worker in ts.who_has:
                 # This also effectively pops from available
                 self.data_needed[worker].remove(ts)
             to_gather.append(ts)
-            total_nbytes += ts.get_nbytes()
+            message_nbytes += ts.get_nbytes()
 
-        return to_gather, total_nbytes
+        return to_gather, message_nbytes
+
+    def _task_exceeds_transfer_limits(self, ts: TaskState, message_nbytes: int) -> bool:
+        """Would asking to gather this task exceed transfer limits?
+
+        Parameters
+        ----------
+        ts
+            Candidate task for gathering
+        message_nbytes
+            Total number of bytes already scheduled for gathering in this message
+        Returns
+        -------
+        exceeds_limit
+            True if gathering the task would exceed limits, False otherwise
+            (in which case the task can be gathered).
+        """
+        if self.transfer_incoming_bytes == 0 and message_nbytes == 0:
+            # When there is no other traffic, the top-priority task is fetched
+            # regardless of its size to ensure progress
+            return False
+
+        incoming_bytes_allowance = (
+            self.transfer_incoming_bytes_limit - self.transfer_incoming_bytes
+        )
+
+        # If message_nbytes == 0, i.e., this is the first task to gather in this
+        # message, ignore `self.transfer_message_bytes_limit` for the top-priority
+        # task to ensure progress. Otherwise:
+        if message_nbytes != 0:
+            incoming_bytes_allowance = (
+                min(
+                    incoming_bytes_allowance,
+                    self.transfer_message_bytes_limit,
+                )
+                - message_nbytes
+            )
+
+        return ts.get_nbytes() > incoming_bytes_allowance
 
     def _ensure_computing(self) -> RecsInstrs:
         if not self.running:
@@ -1720,6 +1815,7 @@ class WorkerState:
         ts.state = "memory"
         if ts.nbytes is None:
             ts.nbytes = sizeof(value)
+        self.nbytes += ts.nbytes
 
         ts.type = type(value)
 
@@ -1859,6 +1955,8 @@ class WorkerState:
     def _transition_memory_released(
         self, ts: TaskState, *, stimulus_id: str
     ) -> RecsInstrs:
+        assert ts.nbytes is not None
+        self.nbytes -= ts.nbytes
         recs, instructions = self._transition_generic_released(
             ts, stimulus_id=stimulus_id
         )
@@ -2049,24 +2147,39 @@ class WorkerState:
         See also
         --------
         _transition_cancelled_fetch
+        _transition_cancelled_or_resumed_long_running
         _transition_cancelled_waiting
         _transition_resumed_fetch
         """
         # None of the exit events of execute or gather_dep recommend a transition to
         # waiting
         assert not ts.done
-        if ts.previous in ("executing", "long-running"):
+        if ts.previous == "executing":
             assert ts.next == "fetch"
             # We're back where we started. We should forget about the entire
             # cancellation attempt
-            ts.state = ts.previous
+            ts.state = "executing"
             ts.next = None
             ts.previous = None
-        elif self.validate:
+            return {}, []
+
+        elif ts.previous == "long-running":
+            assert ts.next == "fetch"
+            # Same as executing, and in addition send the LongRunningMsg in arrears
+            # Note that, if the task seceded before it was cancelled, this will cause
+            # the message to be sent twice.
+            ts.state = "long-running"
+            ts.next = None
+            ts.previous = None
+            smsg = LongRunningMsg(
+                key=ts.key, compute_duration=None, stimulus_id=stimulus_id
+            )
+            return {}, [smsg]
+
+        else:
             assert ts.previous == "flight"
             assert ts.next == "waiting"
-
-        return {}, []
+            return {}, []
 
     def _transition_cancelled_fetch(
         self, ts: TaskState, *, stimulus_id: str
@@ -2103,17 +2216,29 @@ class WorkerState:
         See also
         --------
         _transition_cancelled_fetch
+        _transition_cancelled_or_resumed_long_running
         _transition_resumed_fetch
         _transition_resumed_waiting
         """
         # None of the exit events of gather_dep or execute recommend a transition to
         # waiting
         assert not ts.done
-        if ts.previous in ("executing", "long-running"):
+        if ts.previous == "executing":
             # Forget the task was cancelled to begin with
-            ts.state = ts.previous
+            ts.state = "executing"
             ts.previous = None
             return {}, []
+        elif ts.previous == "long-running":
+            # Forget the task was cancelled to begin with, and inform the scheduler
+            # in arrears that it has seceded.
+            # Note that, if the task seceded before it was cancelled, this will cause
+            # the message to be sent twice.
+            ts.state = "long-running"
+            ts.previous = None
+            smsg = LongRunningMsg(
+                key=ts.key, compute_duration=None, stimulus_id=stimulus_id
+            )
+            return {}, [smsg]
         else:
             assert ts.previous == "flight"
             ts.state = "resumed"
@@ -2206,6 +2331,11 @@ class WorkerState:
     def _transition_executing_long_running(
         self, ts: TaskState, compute_duration: float, *, stimulus_id: str
     ) -> RecsInstrs:
+        """
+        See also
+        --------
+        _transition_cancelled_or_resumed_long_running
+        """
         ts.state = "long-running"
         self.executing.discard(ts)
         self.long_running.add(ts)
@@ -2217,6 +2347,34 @@ class WorkerState:
             ({}, [smsg]),
             self._ensure_computing(),
         )
+
+    def _transition_cancelled_or_resumed_long_running(
+        self, ts: TaskState, compute_duration: float, *, stimulus_id: str
+    ) -> RecsInstrs:
+        """Handles transitions:
+
+        - cancelled(executing) -> long-running
+        - cancelled(long-running) -> long-running (user called secede() twice)
+        - resumed(executing->fetch) -> long-running
+        - resumed(long-running->fetch) -> long-running (user called secede() twice)
+
+        Unlike in the executing->long_running transition, do not send LongRunningMsg.
+        From the scheduler's perspective, this task no longer exists (cancelled) or is
+        in memory on another worker (resumed). So it shouldn't hear about it.
+        Instead, we're going to send the LongRunningMsg when and if the task
+        transitions back to waiting.
+
+        See also
+        --------
+        _transition_executing_long_running
+        _transition_cancelled_waiting
+        _transition_resumed_waiting
+        """
+        assert ts.previous in ("executing", "long-running")
+        ts.previous = "long-running"
+        self.executing.discard(ts)
+        self.long_running.add(ts)
+        return self._ensure_computing()
 
     def _transition_executing_memory(
         self, ts: TaskState, value: object, *, stimulus_id: str
@@ -2324,6 +2482,7 @@ class WorkerState:
     ] = {
         ("cancelled", "error"): _transition_cancelled_released,
         ("cancelled", "fetch"): _transition_cancelled_fetch,
+        ("cancelled", "long-running"): _transition_cancelled_or_resumed_long_running,
         ("cancelled", "memory"): _transition_cancelled_released,
         ("cancelled", "missing"): _transition_cancelled_released,
         ("cancelled", "released"): _transition_cancelled_released,
@@ -2331,8 +2490,8 @@ class WorkerState:
         ("cancelled", "waiting"): _transition_cancelled_waiting,
         ("resumed", "error"): _transition_resumed_error,
         ("resumed", "fetch"): _transition_resumed_fetch,
+        ("resumed", "long-running"): _transition_cancelled_or_resumed_long_running,
         ("resumed", "memory"): _transition_resumed_memory,
-        ("resumed", "missing"): _transition_resumed_missing,
         ("resumed", "released"): _transition_resumed_released,
         ("resumed", "rescheduled"): _transition_resumed_rescheduled,
         ("resumed", "waiting"): _transition_resumed_waiting,
@@ -2729,7 +2888,8 @@ class WorkerState:
                     priority=priority,
                     stimulus_id=ev.stimulus_id,
                 )
-                self.tasks[dep_key].nbytes = nbytes
+                if dep_ts.state != "memory":
+                    dep_ts.nbytes = nbytes
 
                 # link up to child / parents
                 ts.dependencies.add(dep_ts)
@@ -2755,7 +2915,7 @@ class WorkerState:
         --------
         _execute_done_common
         """
-        self.comm_nbytes -= ev.total_nbytes
+        self.transfer_incoming_bytes -= ev.total_nbytes
         keys = self.in_flight_workers.pop(ev.worker)
         for key in keys:
             ts = self.tasks[key]
@@ -2767,7 +2927,7 @@ class WorkerState:
     @_handle_event.register
     def _handle_gather_dep_success(self, ev: GatherDepSuccessEvent) -> RecsInstrs:
         """gather_dep terminated successfully.
-        The response may contain less keys than the request.
+        The response may contain fewer keys than the request.
         """
         recommendations: Recs = {}
         for ts in self._gather_dep_done_common(ev):
@@ -2869,10 +3029,9 @@ class WorkerState:
     @_handle_event.register
     def _handle_secede(self, ev: SecedeEvent) -> RecsInstrs:
         ts = self.tasks.get(ev.key)
-        if ts and ts.state == "executing":
-            return {ts: ("long-running", ev.compute_duration)}, []
-        else:
+        if not ts:
             return {}, []
+        return {ts: ("long-running", ev.compute_duration)}, []
 
     @_handle_event.register
     def _handle_steal_request(self, ev: StealRequestEvent) -> RecsInstrs:
@@ -3322,6 +3481,11 @@ class WorkerState:
             self.long_running,
         ):
             assert self.tasks[ts.key] is ts
+
+        expect_nbytes = sum(
+            self.tasks[key].nbytes or 0 for key in chain(self.data, self.actors)
+        )
+        assert self.nbytes == expect_nbytes, f"{self.nbytes=}; expected {expect_nbytes}"
 
         for ts in self.tasks.values():
             self.validate_task(ts)

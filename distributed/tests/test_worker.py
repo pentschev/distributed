@@ -15,12 +15,13 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from numbers import Number
 from operator import add
+from textwrap import dedent
 from time import sleep
 from unittest import mock
 
 import psutil
 import pytest
-from tlz import first, pluck, sliding_window
+from tlz import first, merge, pluck, sliding_window
 from tornado.ioloop import IOLoop
 
 import dask
@@ -49,6 +50,7 @@ from distributed.metrics import time
 from distributed.protocol import pickle
 from distributed.scheduler import Scheduler
 from distributed.utils_test import (
+    NO_AMM,
     BlockedExecute,
     BlockedGatherDep,
     BlockedGetData,
@@ -645,47 +647,38 @@ async def test_inter_worker_communication(c, s, a, b):
     assert result == 3
 
 
-@gen_cluster(client=True)
-async def test_clean(c, s, a, b):
-    x = c.submit(inc, 1, workers=a.address)
-    y = c.submit(inc, x, workers=b.address)
+@gen_cluster(client=True, nthreads=[("", 1)])
+async def test_clean(c, s, a):
+    x = c.submit(inc, 1)
+    await x
 
-    await y
-
-    collections = [
-        a.state.tasks,
-        a.data,
-        a.threads,
-    ]
-    for c in collections:
-        assert c
+    collections = [a.state.tasks, a.data, a.threads]
+    assert all(collections)
 
     x.release()
-    y.release()
 
     while x.key in a.state.tasks:
         await asyncio.sleep(0.01)
 
-    for c in collections:
-        assert not c
+    assert not any(collections)
 
 
 @gen_cluster(client=True)
 async def test_message_breakup(c, s, a, b):
     n = 100_000
-    a.state.target_message_size = 10 * n
-    b.state.target_message_size = 10 * n
+    a.state.transfer_message_bytes_limit = 10 * n
+    b.state.transfer_message_bytes_limit = 10 * n
     xs = [
         c.submit(mul, b"%d" % i, n, key=f"x{i}", workers=[a.address]) for i in range(30)
     ]
     y = c.submit(lambda _: None, xs, key="y", workers=[b.address])
     await y
 
-    assert 2 <= len(b.incoming_transfer_log) <= 20
-    assert 2 <= len(a.outgoing_transfer_log) <= 20
+    assert 2 <= len(b.transfer_incoming_log) <= 20
+    assert 2 <= len(a.transfer_outgoing_log) <= 20
 
-    assert all(msg["who"] == b.address for msg in a.outgoing_transfer_log)
-    assert all(msg["who"] == a.address for msg in a.incoming_transfer_log)
+    assert all(msg["who"] == b.address for msg in a.transfer_outgoing_log)
+    assert all(msg["who"] == a.address for msg in a.transfer_incoming_log)
 
 
 @gen_cluster(client=True)
@@ -764,7 +757,7 @@ async def test_gather_many_small(c, s, a, *snd_workers, as_deps):
     concurrent outgoing connections. If multiple small fetches from the same worker are
     scheduled all at once, they will result in a single call to gather_dep.
     """
-    a.state.total_out_connections = 2
+    a.state.transfer_incoming_count_limit = 2
     futures = await c.scatter(
         {f"x{i}": i for i in range(100)},
         workers=[w.address for w in snd_workers],
@@ -779,7 +772,7 @@ async def test_gather_many_small(c, s, a, *snd_workers, as_deps):
         while len(a.data) < 100:
             await asyncio.sleep(0.01)
 
-    assert a.state.comm_nbytes == 0
+    assert a.state.transfer_incoming_bytes == 0
 
     story = a.state.story("request-dep", "receive-dep")
     assert len(story) == 40  # 1 request-dep + 1 receive-dep per sender worker
@@ -806,29 +799,37 @@ async def test_multiple_transfers(c, s, w1, w2, w3):
 
 
 @pytest.mark.xfail(reason="very high flakiness")
-@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 3)
+@gen_cluster(
+    client=True,
+    nthreads=[("127.0.0.1", 1)] * 3,
+    config=NO_AMM,
+)
 async def test_share_communication(c, s, w1, w2, w3):
-    x = c.submit(mul, b"1", int(w3.target_message_size + 1), workers=w1.address)
-    y = c.submit(mul, b"2", int(w3.target_message_size + 1), workers=w2.address)
+    x = c.submit(
+        mul, b"1", int(w3.transfer_message_bytes_limit + 1), workers=w1.address
+    )
+    y = c.submit(
+        mul, b"2", int(w3.transfer_message_bytes_limit + 1), workers=w2.address
+    )
     await wait([x, y])
-    await c._replicate([x, y], workers=[w1.address, w2.address])
+    await c.replicate([x, y], workers=[w1.address, w2.address])
     z = c.submit(add, x, y, workers=w3.address)
     await wait(z)
-    assert len(w3.incoming_transfer_log) == 2
-    assert w1.outgoing_transfer_log
-    assert w2.outgoing_transfer_log
+    assert len(w3.transfer_incoming_log) == 2
+    assert w1.transfer_outgoing_log
+    assert w2.transfer_outgoing_log
 
 
 @pytest.mark.xfail(reason="very high flakiness")
 @gen_cluster(client=True)
 async def test_dont_overlap_communications_to_same_worker(c, s, a, b):
-    x = c.submit(mul, b"1", int(b.target_message_size + 1), workers=a.address)
-    y = c.submit(mul, b"2", int(b.target_message_size + 1), workers=a.address)
+    x = c.submit(mul, b"1", int(b.transfer_message_bytes_limit + 1), workers=a.address)
+    y = c.submit(mul, b"2", int(b.transfer_message_bytes_limit + 1), workers=a.address)
     await wait([x, y])
     z = c.submit(add, x, y, workers=b.address)
     await wait(z)
-    assert len(b.incoming_transfer_log) == 2
-    l1, l2 = b.incoming_transfer_log
+    assert len(b.transfer_incoming_log) == 2
+    l1, l2 = b.transfer_incoming_log
 
     assert l1["stop"] < l2["start"]
 
@@ -863,7 +864,7 @@ async def test_clean_up_dependencies(c, s, a, b):
     assert set(a.data) | set(b.data) == {zz.key}
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_hold_onto_dependents(c, s, a, b):
     x = c.submit(inc, 1, workers=a.address)
     y = c.submit(inc, x, workers=b.address)
@@ -1079,7 +1080,7 @@ async def test_service_hosts_match_worker(s):
         sock = first(w.http_server._sockets.values())
         assert sock.getsockname()[0] in ("::", "0.0.0.0")
 
-    # See what happens with e.g. `dask-worker --listen-address tcp://:8811`
+    # See what happens with e.g. `dask worker --listen-address tcp://:8811`
     async with Worker(s.address, host="") as w:
         sock = first(w.http_server._sockets.values())
         assert sock.getsockname()[0] in ("::", "0.0.0.0")
@@ -1244,8 +1245,8 @@ async def test_wait_for_outgoing(c, s, a, b):
     y = c.submit(inc, future, workers=b.address)
     await wait(y)
 
-    assert len(b.incoming_transfer_log) == len(a.outgoing_transfer_log) == 1
-    bb = b.incoming_transfer_log[0]["duration"]
+    assert len(b.transfer_incoming_log) == len(a.transfer_outgoing_log) == 1
+    bb = b.transfer_incoming_log[0]["duration"]
     aa = a.outgoing_transfer_log[0]["duration"]
     ratio = aa / bb
 
@@ -1254,7 +1255,9 @@ async def test_wait_for_outgoing(c, s, a, b):
 
 @pytest.mark.skipif(not LINUX, reason="Need 127.0.0.2 to mean localhost")
 @gen_cluster(
-    nthreads=[("127.0.0.1", 1), ("127.0.0.1", 1), ("127.0.0.2", 1)], client=True
+    nthreads=[("127.0.0.1", 1), ("127.0.0.1", 1), ("127.0.0.2", 1)],
+    client=True,
+    config=NO_AMM,
 )
 async def test_prefer_gather_from_local_address(c, s, w1, w2, w3):
     x = await c.scatter(123, workers=[w1.address, w3.address], broadcast=True)
@@ -1262,8 +1265,8 @@ async def test_prefer_gather_from_local_address(c, s, w1, w2, w3):
     y = c.submit(inc, x, workers=[w2.address])
     await wait(y)
 
-    assert any(d["who"] == w2.address for d in w1.outgoing_transfer_log)
-    assert not any(d["who"] == w2.address for d in w3.outgoing_transfer_log)
+    assert any(d["who"] == w2.address for d in w1.transfer_outgoing_log)
+    assert not any(d["who"] == w2.address for d in w3.transfer_outgoing_log)
 
 
 @gen_cluster(
@@ -1281,10 +1284,10 @@ async def test_avoid_oversubscription(c, s, *workers):
     await wait(futures)
 
     # Original worker not responsible for all transfers
-    assert len(workers[0].outgoing_transfer_log) < len(workers) - 2
+    assert len(workers[0].transfer_outgoing_log) < len(workers) - 2
 
     # Some other workers did some work
-    assert len([w for w in workers if len(w.outgoing_transfer_log) > 0]) >= 3
+    assert len([w for w in workers if len(w.transfer_outgoing_log) > 0]) >= 3
 
 
 @gen_cluster(client=True, worker_kwargs={"metrics": {"my_port": lambda w: w.port}})
@@ -1538,7 +1541,7 @@ async def test_close_while_executing(c, s, a, sync):
     )
     await a.close()
     assert task.cancelled()
-    assert s.tasks["f1"].state == "no-worker"
+    assert s.tasks["f1"].state in ("queued", "no-worker")
 
 
 @pytest.mark.slow
@@ -1566,7 +1569,7 @@ async def test_close_async_task_handles_cancellation(c, s, a):
     assert "Failed to cancel asyncio task" in logger.getvalue()
     assert time() - start < 5
     assert not task.cancelled()
-    assert s.tasks["f1"].state == "no-worker"
+    assert s.tasks["f1"].state in ("queued", "no-worker")
     task.cancel()
     await asyncio.wait({task})
 
@@ -1627,51 +1630,128 @@ async def test_bad_startup(s):
         pass
 
 
-@gen_cluster(client=True)
-async def test_pip_install(c, s, a, b):
-    with mock.patch(
-        "distributed.diagnostics.plugin.subprocess.Popen.communicate",
-        return_value=(b"", b""),
-    ) as p1:
+@gen_cluster(client=True, nthreads=[("", 1)])
+async def test_pip_install(c, s, a):
+    with captured_logger(
+        "distributed.diagnostics.plugin", level=logging.INFO
+    ) as logger:
+        mocked = mock.Mock()
+        mocked.configure_mock(
+            **{"communicate.return_value": (b"", b""), "wait.return_value": 0}
+        )
         with mock.patch(
-            "distributed.diagnostics.plugin.subprocess.Popen", return_value=p1
-        ) as p2:
-            p1.communicate.return_value = b"", b""
-            p1.wait.return_value = 0
+            "distributed.diagnostics.plugin.subprocess.Popen", return_value=mocked
+        ) as Popen:
             await c.register_worker_plugin(
                 PipInstall(packages=["requests"], pip_options=["--upgrade"])
             )
 
-            args = p2.call_args[0][0]
+            args = Popen.call_args[0][0]
             assert "python" in args[0]
             assert args[1:] == ["-m", "pip", "install", "--upgrade", "requests"]
+            assert Popen.call_count == 1
+            logs = logger.getvalue()
+            assert "Pip installing" in logs
+            assert "failed" not in logs
+            assert "restart" not in logs
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, nthreads=[("", 2), ("", 2)])
 async def test_pip_install_fails(c, s, a, b):
     with captured_logger(
         "distributed.diagnostics.plugin", level=logging.ERROR
     ) as logger:
-        with mock.patch(
-            "distributed.diagnostics.plugin.subprocess.Popen.communicate",
-            return_value=(b"", b"error"),
-        ) as p1:
-            with mock.patch(
-                "distributed.diagnostics.plugin.subprocess.Popen", return_value=p1
-            ) as p2:
-                p1.communicate.return_value = (
+        mocked = mock.Mock()
+        mocked.configure_mock(
+            **{
+                "communicate.return_value": (
                     b"",
                     b"Could not find a version that satisfies the requirement not-a-package",
-                )
-                p1.wait.return_value = 1
+                ),
+                "wait.return_value": 1,
+            }
+        )
+        with mock.patch(
+            "distributed.diagnostics.plugin.subprocess.Popen", return_value=mocked
+        ) as Popen:
+            with pytest.raises(RuntimeError):
                 await c.register_worker_plugin(PipInstall(packages=["not-a-package"]))
 
-                assert "not-a-package" in logger.getvalue()
+            assert Popen.call_count == 1
+            logs = logger.getvalue()
+            assert "install failed" in logs
+            assert "not-a-package" in logs
 
 
-#             args = p2.call_args[0][0]
-#             assert "python" in args[0]
-#             assert args[1:] == ["-m", "pip", "--upgrade", "install", "requests"]
+@gen_cluster(client=True, nthreads=[])
+async def test_pip_install_restarts_on_nanny(c, s):
+    preload = dedent(
+        """\
+        from unittest import mock
+
+        mock.patch(
+            "distributed.diagnostics.plugin.PipInstall._install", return_value=None
+        ).start()
+        """
+    )
+    async with Nanny(s.address, preload=preload):
+        (addr,) = s.workers
+        await c.register_worker_plugin(
+            PipInstall(packages=["requests"], pip_options=["--upgrade"], restart=True)
+        )
+
+        # Wait until the worker is restarted
+        while len(s.workers) != 1 or set(s.workers) == {addr}:
+            await asyncio.sleep(0.01)
+
+
+@gen_cluster(client=True, nthreads=[])
+async def test_pip_install_failing_does_not_restart_on_nanny(c, s):
+    preload = dedent(
+        """\
+        from unittest import mock
+
+        mock.patch(
+            "distributed.diagnostics.plugin.PipInstall._install", side_effect=RuntimeError
+        ).start()
+        """
+    )
+    async with Nanny(s.address, preload=preload) as n:
+        (addr,) = s.workers
+        with pytest.raises(RuntimeError):
+            await c.register_worker_plugin(
+                PipInstall(
+                    packages=["requests"], pip_options=["--upgrade"], restart=True
+                )
+            )
+        # Nanny does not restart
+        assert n.status is Status.running
+        assert set(s.workers) == {addr}
+
+
+@gen_cluster(client=True, nthreads=[("", 1), ("", 1)])
+async def test_pip_install_multiple_workers(c, s, a, b):
+    with captured_logger(
+        "distributed.diagnostics.plugin", level=logging.INFO
+    ) as logger:
+        mocked = mock.Mock()
+        mocked.configure_mock(
+            **{"communicate.return_value": (b"", b""), "wait.return_value": 0}
+        )
+        with mock.patch(
+            "distributed.diagnostics.plugin.subprocess.Popen", return_value=mocked
+        ) as Popen:
+            await c.register_worker_plugin(
+                PipInstall(packages=["requests"], pip_options=["--upgrade"])
+            )
+
+            args = Popen.call_args[0][0]
+            assert "python" in args[0]
+            assert args[1:] == ["-m", "pip", "install", "--upgrade", "requests"]
+            assert Popen.call_count == 1
+            logs = logger.getvalue()
+            assert "Pip installing" in logs
+            assert "already been installed" in logs
 
 
 @gen_cluster(nthreads=[])
@@ -1943,8 +2023,8 @@ async def test_worker_descopes_data(c, s, a):
     assert not C.instances
 
 
-@pytest.mark.slow
-@gen_cluster(client=True)
+# @pytest.mark.slow
+@gen_cluster(client=True, config=NO_AMM)
 async def test_gather_dep_one_worker_always_busy(c, s, a, b):
     # Ensure that both dependencies for H are on another worker than H itself.
     # The worker where the dependencies are on is then later blocked such that
@@ -1959,14 +2039,11 @@ async def test_gather_dep_one_worker_always_busy(c, s, a, b):
     # We will block A for any outgoing communication. This simulates an
     # overloaded worker which will always return "busy" for get_data requests,
     # effectively blocking H indefinitely
-    a.outgoing_current_count = 10000000
+    a.transfer_outgoing_count = 10000000
 
     h = c.submit(add, f, g, key="h", workers=[b.address])
 
-    while h.key not in b.state.tasks:
-        await asyncio.sleep(0.01)
-
-    assert b.state.tasks[h.key].state == "waiting"
+    await wait_for_state(h.key, "waiting", b)
     assert b.state.tasks[f.key].state in ("flight", "fetch")
     assert b.state.tasks[g.key].state in ("flight", "fetch")
 
@@ -1995,6 +2072,7 @@ async def test_gather_dep_one_worker_always_busy(c, s, a, b):
 @gen_cluster(
     client=True,
     nthreads=[("127.0.0.1", 1)] * 2 + [("127.0.0.2", 2)] * 10,  # type: ignore
+    config=NO_AMM,
 )
 async def test_gather_dep_local_workers_first(c, s, a, lw, *rws):
     f = (
@@ -2011,6 +2089,7 @@ async def test_gather_dep_local_workers_first(c, s, a, lw, *rws):
 @gen_cluster(
     client=True,
     nthreads=[("127.0.0.2", 1)] + [("127.0.0.1", 1)] * 10,  # type: ignore
+    config=NO_AMM,
 )
 async def test_gather_dep_from_remote_workers_if_all_local_workers_are_busy(
     c, s, rw, a, *lws
@@ -2021,7 +2100,7 @@ async def test_gather_dep_from_remote_workers_if_all_local_workers_are_busy(
         )
     )["f"]
     for w in lws:
-        w.outgoing_current_count = 10000000
+        w.transfer_outgoing_count = 10000000
 
     g = c.submit(inc, f, key="g", workers=[a.address])
     assert await g == 2
@@ -2240,7 +2319,9 @@ async def test_gpu_executor(c, s, w):
         assert "gpu" not in w.executors
 
 
-async def assert_task_states_on_worker(expected, worker):
+async def assert_task_states_on_worker(
+    expected: dict[str, str], worker: Worker
+) -> None:
     active_exc = None
     for _ in range(10):
         try:
@@ -2266,7 +2347,7 @@ async def assert_task_states_on_worker(expected, worker):
     raise active_exc
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_worker_state_error_release_error_last(c, s, a, b):
     """
     Create a chain of tasks and err one of them. Then release tasks in a certain
@@ -2333,7 +2414,7 @@ async def test_worker_state_error_release_error_last(c, s, a, b):
         await asyncio.sleep(0.01)
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_worker_state_error_release_error_first(c, s, a, b):
     """
     Create a chain of tasks and err one of them. Then release tasks in a certain
@@ -2398,7 +2479,7 @@ async def test_worker_state_error_release_error_first(c, s, a, b):
         await asyncio.sleep(0.01)
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_worker_state_error_release_error_int(c, s, a, b):
     """
     Create a chain of tasks and err one of them. Then release tasks in a certain
@@ -2463,7 +2544,7 @@ async def test_worker_state_error_release_error_int(c, s, a, b):
         await asyncio.sleep(0.01)
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_worker_state_error_long_chain(c, s, a, b):
     def raise_exc(*args):
         raise RuntimeError()
@@ -2546,7 +2627,7 @@ async def test_worker_state_error_long_chain(c, s, a, b):
         await asyncio.sleep(0.01)
 
 
-@gen_cluster(client=True, nthreads=[("", x) for x in (1, 2, 3, 4)])
+@gen_cluster(client=True, nthreads=[("", x) for x in (1, 2, 3, 4)], config=NO_AMM)
 async def test_hold_on_to_replicas(c, s, *workers):
     f1 = c.submit(inc, 1, workers=[workers[0].address], key="f1")
     f2 = c.submit(inc, 2, workers=[workers[1].address], key="f2")
@@ -2669,7 +2750,7 @@ async def test_run_spec_deserialize_fail(c, s, a, b):
     assert "return lambda: 1 / 0, ()" in logvalue
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_acquire_replicas(c, s, a, b):
     fut = c.submit(inc, 1, workers=[a.address])
     await fut
@@ -2689,7 +2770,7 @@ async def test_acquire_replicas(c, s, a, b):
         await asyncio.sleep(0.005)
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_acquire_replicas_same_channel(c, s, a, b):
     futA = c.submit(inc, 1, workers=[a.address], key="f-A")
     futB = c.submit(inc, 2, workers=[a.address], key="f-B")
@@ -2718,10 +2799,10 @@ async def test_acquire_replicas_same_channel(c, s, a, b):
                 ("request-dep", a.address, {fut.key}),
             ],
         )
-        assert any(fut.key in msg["keys"] for msg in b.incoming_transfer_log)
+        assert any(fut.key in msg["keys"] for msg in b.transfer_incoming_log)
 
 
-@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 3)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 3, config=NO_AMM)
 async def test_acquire_replicas_many(c, s, w1, w2, w3):
     futs = c.map(inc, range(10), workers=[w1.address])
     res = c.submit(sum, futs, workers=[w2.address])
@@ -2751,7 +2832,7 @@ async def test_acquire_replicas_many(c, s, w1, w2, w3):
         await asyncio.sleep(0.001)
 
 
-@gen_cluster(client=True, nthreads=[("", 1)])
+@gen_cluster(client=True, nthreads=[("", 1)], config=NO_AMM)
 async def test_acquire_replicas_already_in_flight(c, s, a):
     """Trying to acquire a replica that is already in flight is a no-op"""
     async with BlockedGatherDep(s.address) as b:
@@ -2779,7 +2860,7 @@ async def test_acquire_replicas_already_in_flight(c, s, a):
 
 
 @pytest.mark.slow
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_forget_acquire_replicas(c, s, a, b):
     """
     1. The scheduler sends acquire-replicas to the worker
@@ -2807,7 +2888,7 @@ async def test_forget_acquire_replicas(c, s, a, b):
     assert "x" not in s.tasks
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_remove_replicas_simple(c, s, a, b):
     futs = c.map(inc, range(10), workers=[a.address])
     await wait(futs)
@@ -2835,7 +2916,7 @@ async def test_remove_replicas_simple(c, s, a, b):
 @gen_cluster(
     client=True,
     nthreads=[("", 1), ("", 6)],  # Up to 5 threads of b will get stuck; read below
-    config={"distributed.comm.recent-messages-log-length": 1_000},
+    config=merge(NO_AMM, {"distributed.comm.recent-messages-log-length": 1_000}),
 )
 async def test_remove_replicas_while_computing(c, s, a, b):
     futs = c.map(inc, range(10), workers=[a.address])
@@ -2935,7 +3016,7 @@ async def test_remove_replicas_while_computing(c, s, a, b):
         await asyncio.sleep(0.01)
 
 
-@gen_cluster(client=True, nthreads=[("", 1)] * 3)
+@gen_cluster(client=True, nthreads=[("", 1)] * 3, config=NO_AMM)
 async def test_who_has_consistent_remove_replicas(c, s, *workers):
     a = workers[0]
     other_workers = {w for w in workers if w != a}
@@ -2971,7 +3052,7 @@ async def test_who_has_consistent_remove_replicas(c, s, *workers):
     assert s.tasks[f1.key].suspicious == 0
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_acquire_replicas_with_no_priority(c, s, a, b):
     """Scattered tasks have no priority. When they transit to another worker through
     acquire-replicas, they end up in the Worker.data_needed heap together with tasks
@@ -2994,12 +3075,12 @@ async def test_acquire_replicas_with_no_priority(c, s, a, b):
     assert b.state.tasks["x"].priority is not None
 
 
-@gen_cluster(client=True, nthreads=[("", 1)])
+@gen_cluster(client=True, nthreads=[("", 1)], config=NO_AMM)
 async def test_acquire_replicas_large_data(c, s, a):
     """When acquire-replicas is used to acquire multiple sizeable tasks, it respects
-    target_message_size and acquires them over multiple iterations.
+    transfer_message_bytes_limit and acquires them over multiple iterations.
     """
-    size = a.state.target_message_size // 5 - 10_000
+    size = a.state.transfer_message_bytes_limit // 5 - 10_000
 
     class C:
         def __sizeof__(self):
@@ -3026,7 +3107,7 @@ async def test_missing_released_zombie_tasks(c, s, a, b):
     Ensure that no fetch/flight tasks are left in the task dict of a
     worker after everything was released
     """
-    a.total_in_connections = 0
+    a.transfer_outgoing_count_limit = 0
     f1 = c.submit(inc, 1, key="f1", workers=[a.address])
     f2 = c.submit(inc, f1, key="f2", workers=[b.address])
     key = f1.key
@@ -3112,7 +3193,12 @@ async def test_worker_status_sync(s, a):
             "prev-status": "paused",
             "status": "running",
         },
-        {"action": "remove-worker", "processing-tasks": {}},
+        {
+            "action": "worker-status-change",
+            "prev-status": "running",
+            "status": "closing_gracefully",
+        },
+        {"action": "remove-worker", "processing-tasks": set()},
         {"action": "retired"},
     ]
 
@@ -3310,8 +3396,8 @@ async def test_Worker__to_dict(c, s, a):
         "thread_id",
         "logs",
         "config",
-        "incoming_transfer_log",
-        "outgoing_transfer_log",
+        "transfer_incoming_log",
+        "transfer_outgoing_log",
         # Attributes of WorkerMemoryManager
         "data",
         "max_spill",
@@ -3551,3 +3637,20 @@ async def test_execute_preamble_abort_retirement(c, s):
 
         # Test that y does not get stuck.
         assert await y == 2
+
+
+@gen_cluster()
+async def test_deprecation_of_renamed_worker_attributes(s, a, b):
+    msg = (
+        "The `Worker.outgoing_count` attribute has been renamed to "
+        "`Worker.transfer_outgoing_count_total`"
+    )
+    with pytest.warns(DeprecationWarning, match=msg):
+        assert a.outgoing_count == a.transfer_outgoing_count_total
+
+    msg = (
+        "The `Worker.outgoing_current_count` attribute has been renamed to "
+        "`Worker.transfer_outgoing_count`"
+    )
+    with pytest.warns(DeprecationWarning, match=msg):
+        assert a.outgoing_current_count == a.transfer_outgoing_count

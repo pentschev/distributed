@@ -237,58 +237,58 @@ class UCX(Comm):
     ) -> int:
         if self.closed():
             raise CommClosedError("Endpoint is closed -- unable to send message")
-        try:
-            if serializers is None:
-                serializers = ("cuda", "dask", "pickle", "error")
-            frames = await to_frames(
-                msg,
-                serializers=serializers,
-                on_error=on_error,
-                allow_offload=self.allow_offload,
+
+        if serializers is None:
+            serializers = ("cuda", "dask", "pickle", "error")
+        # msg can also be a list of dicts when sending batched messages
+        frames = await to_frames(
+            msg,
+            serializers=serializers,
+            on_error=on_error,
+            allow_offload=self.allow_offload,
+        )
+        sizes = tuple(nbytes(f) for f in frames)
+
+        if multi_buffer is True:
+            if any(hasattr(f, "__cuda_array_interface__") for f in frames):
+                synchronize_stream(0)
+
+            close = [struct.pack("?", False)]
+            await self.ep.send_multi(close + frames)
+        else:
+            nframes = len(frames)
+            cuda_frames = tuple(hasattr(f, "__cuda_array_interface__") for f in frames)
+            cuda_send_frames, send_frames = zip(
+                *(
+                    (is_cuda, each_frame)
+                    for is_cuda, each_frame in zip(cuda_frames, frames)
+                    if nbytes(each_frame) > 0
+                )
             )
-            sizes = tuple(nbytes(f) for f in frames)
 
-            if multi_buffer is True:
-                if any(hasattr(f, "__cuda_array_interface__") for f in frames):
-                    synchronize_stream(0)
+        try:
+            # Send meta data
 
-                close = [struct.pack("?", False)]
-                await self.ep.send_multi(close + frames)
-            else:
-                nframes = len(frames)
-                cuda_frames = tuple(
-                    hasattr(f, "__cuda_array_interface__") for f in frames
-                )
-                cuda_send_frames, send_frames = zip(
-                    *(
-                        (is_cuda, each_frame)
-                        for is_cuda, each_frame in zip(cuda_frames, frames)
-                        if nbytes(each_frame) > 0
-                    )
-                )
+            # Send close flag and number of frames (_Bool, int64)
+            await self.ep.send(struct.pack("?Q", False, nframes))
+            # Send which frames are CUDA (bool) and
+            # how large each frame is (uint64)
+            await self.ep.send(
+                struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
+            )
 
-                # Send meta data
+            # Send frames
 
-                # Send close flag and number of frames (_Bool, int64)
-                await self.ep.send(struct.pack("?Q", False, nframes))
-                # Send which frames are CUDA (bool) and
-                # how large each frame is (uint64)
-                await self.ep.send(
-                    struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
-                )
+            # It is necessary to first synchronize the default stream before start
+            # sending We synchronize the default stream because UCX is not
+            # stream-ordered and syncing the default stream will wait for other
+            # non-blocking CUDA streams. Note this is only sufficient if the memory
+            # being sent is not currently in use on non-blocking CUDA streams.
+            if any(cuda_send_frames):
+                synchronize_stream(0)
 
-                # Send frames
-
-                # It is necessary to first synchronize the default stream before start
-                # sending We synchronize the default stream because UCX is not
-                # stream-ordered and syncing the default stream will wait for other
-                # non-blocking CUDA streams. Note this is only sufficient if the memory
-                # being sent is not currently in use on non-blocking CUDA streams.
-                if any(cuda_send_frames):
-                    synchronize_stream(0)
-
-                for each_frame in send_frames:
-                    await self.ep.send(each_frame)
+            for each_frame in send_frames:
+                await self.ep.send(each_frame)
             return sum(sizes)
         except (ucp.UCXBaseException):
             self.abort()
@@ -311,15 +311,14 @@ class UCX(Comm):
 
                 if shutdown:  # The writer is closing the connection
                     raise CommClosedError("Connection closed by writer")
-            except (
-                ucp.UCXCloseError,
-                ucp.UCXCanceled,
-                # ) + (getattr(ucp, "UCXConnectionReset", ()),):
-            ) + (
-                getattr(ucp, "UCXConnectionResetError", ()),
-            ):
+            except BaseException as e:
+                # In addition to UCX exceptions, may be CancelledError or another
+                # "low-level" exception. The only safe thing to do is to abort.
+                # (See also https://github.com/dask/distributed/pull/6574).
                 self.abort()
-                raise CommClosedError("Connection closed by writer")
+                raise CommClosedError(
+                    f"Connection closed by writer.\nInner exception: {e!r}"
+                )
         else:
             try:
                 # Recv meta data
@@ -339,15 +338,14 @@ class UCX(Comm):
                 await self.ep.recv(header)
                 header = struct.unpack(header_fmt, header)
                 cuda_frames, sizes = header[:nframes], header[nframes:]
-            except (
-                ucp.UCXCloseError,
-                ucp.UCXCanceled,
-                # ) + (getattr(ucp, "UCXConnectionReset", ()),):
-            ) + (
-                getattr(ucp, "UCXConnectionResetError", ()),
-            ):
+            except BaseException as e:
+                # In addition to UCX exceptions, may be CancelledError or another
+                # "low-level" exception. The only safe thing to do is to abort.
+                # (See also https://github.com/dask/distributed/pull/6574).
                 self.abort()
-                raise CommClosedError("Connection closed by writer")
+                raise CommClosedError(
+                    f"Connection closed by writer.\nInner exception: {e!r}"
+                )
             else:
                 # Recv frames
                 frames = [
@@ -367,15 +365,29 @@ class UCX(Comm):
                 if any(cuda_recv_frames):
                     synchronize_stream(0)
 
-                for each_frame in recv_frames:
-                    await self.ep.recv(each_frame)
+                try:
+                    for each_frame in recv_frames:
+                        await self.ep.recv(each_frame)
+                except BaseException as e:
+                    # In addition to UCX exceptions, may be CancelledError or another
+                    # "low-level" exception. The only safe thing to do is to abort.
+                    # (See also https://github.com/dask/distributed/pull/6574).
+                    self.abort()
+                    raise CommClosedError(
+                        f"Connection closed by writer.\nInner exception: {e!r}"
+                    )
 
-        return await from_frames(
-            frames,
-            deserialize=self.deserialize,
-            deserializers=deserializers,
-            allow_offload=self.allow_offload,
-        )
+        try:
+            return await from_frames(
+                frames,
+                deserialize=self.deserialize,
+                deserializers=deserializers,
+                allow_offload=self.allow_offload,
+            )
+        except EOFError:
+            # Frames possibly garbled or truncated by communication error
+            self.abort()
+            raise CommClosedError("Aborted stream on truncated data")
 
     async def close(self):
         if self._ep is not None:

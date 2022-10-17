@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import pickle
+from collections import defaultdict
 from collections.abc import Iterator
 
 import pytest
@@ -16,6 +17,7 @@ from distributed.protocol.serialize import Serialize
 from distributed.scheduler import TaskState as SchedulerTaskState
 from distributed.utils import recursive_to_dict
 from distributed.utils_test import (
+    NO_AMM,
     _LockedCommPool,
     assert_story,
     freeze_data_fetching,
@@ -41,6 +43,7 @@ from distributed.worker_state_machine import (
     RecommendationsConflict,
     RefreshWhoHasEvent,
     ReleaseWorkerDataMsg,
+    RemoveReplicasEvent,
     RescheduleEvent,
     RescheduleMsg,
     SecedeEvent,
@@ -597,7 +600,11 @@ async def test_fetch_via_amm_to_compute(c, s, a, b):
 
 
 @pytest.mark.parametrize("as_deps", [False, True])
-@gen_cluster(client=True, nthreads=[("", 1)] * 3)
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)] * 3,
+    config=NO_AMM,
+)
 async def test_lose_replica_during_fetch(c, s, w1, w2, w3, as_deps):
     """
     as_deps=True
@@ -673,7 +680,7 @@ async def test_fetch_to_missing_on_busy(c, s, a, b):
     x = c.submit(inc, 1, key="x", workers=[b.address])
     await x
 
-    b.total_in_connections = 0
+    b.transfer_outgoing_count_limit = 0
     # Crucially, unlike with `c.submit(inc, x, workers=[a.address])`, the scheduler
     # doesn't keep track of acquire-replicas requests, so it won't proactively inform a
     # when we call remove_worker later on
@@ -778,7 +785,7 @@ async def test_cancelled_while_in_flight(c, s, a, b):
         await asyncio.sleep(0.01)
 
 
-@gen_cluster(client=True)
+@gen_cluster(client=True, config=NO_AMM)
 async def test_in_memory_while_in_flight(c, s, a, b):
     """
     1. A client scatters x to a
@@ -923,7 +930,7 @@ async def test_fetch_to_missing_on_refresh_who_has(c, s, w1, w2, w3):
     x = c.submit(inc, 1, key="x", workers=[w1.address])
     y = c.submit(inc, 2, key="y", workers=[w1.address])
     await wait([x, y])
-    w1.total_in_connections = 0
+    w1.transfer_outgoing_count_limit = 0
     s.request_acquire_replicas(w3.address, ["x", "y"], stimulus_id="test1")
 
     # The tasks will now flip-flop between fetch and flight every 150ms
@@ -985,17 +992,17 @@ async def test_fetch_to_missing_on_network_failure(c, s, a):
 
 @gen_cluster()
 async def test_deprecated_worker_attributes(s, a, b):
-    n = a.state.comm_threshold_bytes
+    n = a.state.generation
     msg = (
-        "The `Worker.comm_threshold_bytes` attribute has been moved to "
-        "`Worker.state.comm_threshold_bytes`"
+        "The `Worker.generation` attribute has been moved to "
+        "`Worker.state.generation`"
     )
     with pytest.warns(FutureWarning, match=msg):
-        assert a.comm_threshold_bytes == n
+        assert a.generation == n
     with pytest.warns(FutureWarning, match=msg):
-        a.comm_threshold_bytes += 1
-        assert a.comm_threshold_bytes == n + 1
-    assert a.state.comm_threshold_bytes == n + 1
+        a.generation -= 1
+        assert a.generation == n - 1
+    assert a.state.generation == n - 1
 
     # Old and new names differ
     msg = (
@@ -1009,27 +1016,40 @@ async def test_deprecated_worker_attributes(s, a, b):
         assert a.data_needed == set()
 
 
+@pytest.mark.parametrize("n_remote_workers", [1, 2])
 @pytest.mark.parametrize(
-    "nbytes,n_in_flight",
+    "nbytes,n_in_flight_per_worker",
     [
-        # Note: target_message_size = 50e6 bytes
         (int(10e6), 3),
         (int(20e6), 2),
         (int(30e6), 1),
+        (int(60e6), 1),
     ],
 )
-def test_aggregate_gather_deps(ws, nbytes, n_in_flight):
-    ws2 = "127.0.0.1:2"
+def test_aggregate_gather_deps(ws, nbytes, n_in_flight_per_worker, n_remote_workers):
+    ws.transfer_message_bytes_limit = int(50e6)
+    wss = [f"127.0.0.1:{2 + i}" for i in range(n_remote_workers)]
+    who_has = {f"x{i}": [wss[i // 3]] for i in range(3 * n_remote_workers)}
     instructions = ws.handle_stimulus(
         AcquireReplicasEvent(
-            who_has={"x1": [ws2], "x2": [ws2], "x3": [ws2]},
-            nbytes={"x1": nbytes, "x2": nbytes, "x3": nbytes},
+            who_has=who_has,
+            nbytes={task: nbytes for task in who_has.keys()},
             stimulus_id="s1",
         )
     )
-    assert instructions == [GatherDep.match(worker=ws2, stimulus_id="s1")]
-    assert len(instructions[0].to_gather) == n_in_flight
-    assert len(ws.in_flight_tasks) == n_in_flight
+    assert instructions == [
+        GatherDep.match(worker=remote, stimulus_id="s1") for remote in wss
+    ]
+    assert all(
+        len(instruction.to_gather) == n_in_flight_per_worker
+        for instruction in instructions
+    )
+    assert len(ws.in_flight_tasks) == n_in_flight_per_worker * n_remote_workers
+    assert (
+        ws.transfer_incoming_bytes == nbytes * n_in_flight_per_worker * n_remote_workers
+    )
+    assert ws.transfer_incoming_count == n_remote_workers
+    assert ws.transfer_incoming_count_total == n_remote_workers
 
 
 def test_gather_priority(ws):
@@ -1040,7 +1060,7 @@ def test_gather_priority(ws):
     3. in case of tie, from the worker with the most tasks queued
     4. in case of tie, from a random worker (which is actually deterministic).
     """
-    ws.total_out_connections = 4
+    ws.transfer_incoming_count_limit = 4
 
     instructions = ws.handle_stimulus(
         PauseEvent(stimulus_id="pause"),
@@ -1060,8 +1080,9 @@ def test_gather_priority(ws):
                 # This will be fetched first because it's on the same worker as y
                 "x8": ["127.0.0.7:1"],
             },
-            # Substantial nbytes prevents total_out_connections to be overridden by
-            # comm_threshold_bytes, but it's less than target_message_size
+            # Substantial nbytes prevents transfer_incoming_count_limit to be
+            # overridden by transfer_incoming_bytes_throttle_threshold,
+            # but it's less than transfer_message_bytes_limit
             nbytes={f"x{i}": 4 * 2**20 for i in range(1, 9)},
             stimulus_id="compute1",
         ),
@@ -1110,6 +1131,10 @@ def test_gather_priority(ws):
             total_nbytes=4 * 2**20,
         ),
     ]
+    expected_bytes = 1 + 4 * 2**20 + 4 * 2**20 + 8 * 2**20 + 4 * 2**20
+    assert ws.transfer_incoming_bytes == expected_bytes
+    assert ws.transfer_incoming_count == 4
+    assert ws.transfer_incoming_count_total == 4
 
 
 @pytest.mark.parametrize("state", ["executing", "long-running"])
@@ -1263,3 +1288,335 @@ def test_gather_dep_failure(ws):
     ]
     assert ws.tasks["x"].state == "error"
     assert ws.tasks["y"].state == "waiting"  # Not ready
+    assert ws.transfer_incoming_bytes == 0
+    assert ws.transfer_incoming_count == 0
+    assert ws.transfer_incoming_count_total == 1
+
+
+def test_transfer_incoming_metrics(ws):
+    assert ws.transfer_incoming_bytes == 0
+    assert ws.transfer_incoming_count == 0
+    assert ws.transfer_incoming_count_total == 0
+
+    ws2 = "127.0.0.1:2"
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "b", who_has={"a": [ws2]}, nbytes={"a": 7}, stimulus_id="s1"
+        )
+    )
+    assert ws.transfer_incoming_bytes == 7
+    assert ws.transfer_incoming_count == 1
+    assert ws.transfer_incoming_count_total == 1
+
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2, data={"a": 123}, total_nbytes=7, stimulus_id="s2"
+        )
+    )
+    assert ws.transfer_incoming_bytes == 0
+    assert ws.transfer_incoming_count == 0
+    assert ws.transfer_incoming_count_total == 1
+
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "e",
+            who_has={"c": [ws2], "d": [ws2]},
+            nbytes={"c": 11, "d": 13},
+            stimulus_id="s2",
+        )
+    )
+    assert ws.transfer_incoming_bytes == 24
+    assert ws.transfer_incoming_count == 1
+    assert ws.transfer_incoming_count_total == 2
+
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2, data={"c": 123, "d": 234}, total_nbytes=24, stimulus_id="s3"
+        )
+    )
+    assert ws.transfer_incoming_bytes == 0
+    assert ws.transfer_incoming_count == 0
+    assert ws.transfer_incoming_count_total == 2
+
+    ws3 = "127.0.0.1:3"
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "h",
+            who_has={"f": [ws2], "g": [ws3]},
+            nbytes={"f": 17, "g": 19},
+            stimulus_id="s4",
+        )
+    )
+    assert ws.transfer_incoming_bytes == 36
+    assert ws.transfer_incoming_count == 2
+    assert ws.transfer_incoming_count_total == 4
+
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws3, data={"g": 345}, total_nbytes=19, stimulus_id="s5"
+        )
+    )
+    assert ws.transfer_incoming_bytes == 17
+    assert ws.transfer_incoming_count == 1
+    assert ws.transfer_incoming_count_total == 4
+
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2, data={"g": 456}, total_nbytes=17, stimulus_id="s6"
+        )
+    )
+    assert ws.transfer_incoming_bytes == 0
+    assert ws.transfer_incoming_count == 0
+    assert ws.transfer_incoming_count_total == 4
+
+
+def test_throttling_does_not_affect_first_transfer(ws):
+    ws.transfer_incoming_count_limit = 100
+    ws.transfer_incoming_bytes_limit = 100
+    ws.transfer_incoming_bytes_throttle_threshold = 1
+    ws.transfer_message_bytes_limit = 100
+    ws2 = "127.0.0.1:2"
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "c",
+            who_has={"a": [ws2]},
+            nbytes={"a": 200},
+            stimulus_id="s1",
+        )
+    )
+    assert ws.tasks["a"].state == "flight"
+
+
+def test_message_target_does_not_affect_first_transfer_on_different_worker(ws):
+    ws.transfer_incoming_count_limit = 100
+    ws.transfer_incoming_bytes_limit = 600
+    ws.transfer_message_bytes_limit = 100
+    ws.transfer_incoming_bytes_throttle_threshold = 1
+    ws2 = "127.0.0.1:2"
+    ws3 = "127.0.0.1:3"
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "c",
+            who_has={"a": [ws2], "b": [ws3]},
+            nbytes={"a": 200, "b": 200},
+            stimulus_id="s1",
+        )
+    )
+    assert ws.tasks["a"].state == "flight"
+    assert ws.tasks["b"].state == "flight"
+
+
+def test_throttle_incoming_transfers_on_count_limit(ws):
+    ws.transfer_incoming_count_limit = 1
+    ws.transfer_incoming_bytes_limit = 100_000
+    ws.transfer_incoming_bytes_throttle_threshold = 1
+    ws2 = "127.0.0.1:2"
+    ws3 = "127.0.0.1:3"
+    who_has = {"a": [ws2], "b": [ws3]}
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "c",
+            who_has=who_has,
+            nbytes={"a": 100, "b": 100},
+            stimulus_id="s1",
+        )
+    )
+    tasks_by_state = defaultdict(list)
+    for ts in ws.tasks.values():
+        tasks_by_state[ts.state].append(ts)
+    assert len(tasks_by_state["flight"]) == 1
+    assert len(tasks_by_state["fetch"]) == 1
+    assert ws.transfer_incoming_bytes == 100
+
+    in_flight_task = tasks_by_state["flight"][0]
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=who_has[in_flight_task.key][0],
+            data={in_flight_task.key: 123},
+            total_nbytes=100,
+            stimulus_id="s2",
+        )
+    )
+    assert tasks_by_state["flight"][0].state == "memory"
+    assert tasks_by_state["fetch"][0].state == "flight"
+    assert ws.transfer_incoming_bytes == 100
+
+
+def test_throttling_incoming_transfer_on_transfer_bytes_same_worker(ws):
+    ws.transfer_incoming_count_limit = 100
+    ws.transfer_incoming_bytes_limit = 250
+    ws.transfer_incoming_bytes_throttle_threshold = 1
+    ws2 = "127.0.0.1:2"
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "d",
+            who_has={"a": [ws2], "b": [ws2], "c": [ws2]},
+            nbytes={"a": 100, "b": 100, "c": 100},
+            stimulus_id="s1",
+        )
+    )
+    tasks_by_state = defaultdict(list)
+    for ts in ws.tasks.values():
+        tasks_by_state[ts.state].append(ts)
+    assert ws.transfer_incoming_bytes == 200
+    assert len(tasks_by_state["flight"]) == 2
+    assert len(tasks_by_state["fetch"]) == 1
+
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2,
+            data={ts.key: 123 for ts in tasks_by_state["flight"]},
+            total_nbytes=200,
+            stimulus_id="s2",
+        )
+    )
+    assert all(ts.state == "memory" for ts in tasks_by_state["flight"])
+    assert all(ts.state == "flight" for ts in tasks_by_state["fetch"])
+
+
+def test_throttling_incoming_transfer_on_transfer_bytes_different_workers(ws):
+    ws.transfer_incoming_count_limit = 100
+    ws.transfer_incoming_bytes_limit = 150
+    ws.transfer_incoming_bytes_throttle_threshold = 1
+    ws2 = "127.0.0.1:2"
+    ws3 = "127.0.0.1:3"
+    who_has = {"a": [ws2], "b": [ws3]}
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "c",
+            who_has=who_has,
+            nbytes={"a": 100, "b": 100},
+            stimulus_id="s1",
+        )
+    )
+    tasks_by_state = defaultdict(list)
+    for ts in ws.tasks.values():
+        tasks_by_state[ts.state].append(ts)
+    assert ws.transfer_incoming_bytes == 100
+    assert len(tasks_by_state["flight"]) == 1
+    assert len(tasks_by_state["fetch"]) == 1
+
+    in_flight_task = tasks_by_state["flight"][0]
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=who_has[in_flight_task.key][0],
+            data={in_flight_task.key: 123},
+            total_nbytes=100,
+            stimulus_id="s2",
+        )
+    )
+    assert tasks_by_state["flight"][0].state == "memory"
+    assert tasks_by_state["fetch"][0].state == "flight"
+
+
+def test_do_not_throttle_connections_while_below_threshold(ws):
+    ws.transfer_incoming_count_limit = 1
+    ws.transfer_incoming_bytes_limit = 200
+    ws.transfer_incoming_bytes_throttle_threshold = 50
+    ws2 = "127.0.0.1:2"
+    ws3 = "127.0.0.1:3"
+    ws4 = "127.0.0.1:4"
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "b",
+            who_has={"a": [ws2]},
+            nbytes={"a": 1},
+            stimulus_id="s1",
+        )
+    )
+    assert ws.tasks["a"].state == "flight"
+
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "d",
+            who_has={"c": [ws3]},
+            nbytes={"c": 1},
+            stimulus_id="s2",
+        )
+    )
+    assert ws.tasks["c"].state == "flight"
+
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "f",
+            who_has={"e": [ws4]},
+            nbytes={"e": 100},
+            stimulus_id="s3",
+        )
+    )
+    assert ws.tasks["e"].state == "flight"
+    assert ws.transfer_incoming_bytes == 102
+
+
+def test_throttle_on_transfer_bytes_regardless_of_threshold(ws):
+    ws.transfer_incoming_count_limit = 1
+    ws.transfer_incoming_bytes_limit = 100
+    ws.transfer_incoming_bytes_throttle_threshold = 50
+    ws2 = "127.0.0.1:2"
+    ws3 = "127.0.0.1:3"
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "b",
+            who_has={"a": [ws2]},
+            nbytes={"a": 1},
+            stimulus_id="s1",
+        )
+    )
+    assert ws.tasks["a"].state == "flight"
+
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "d",
+            who_has={"c": [ws3]},
+            nbytes={"c": 100},
+            stimulus_id="s2",
+        )
+    )
+    assert ws.tasks["c"].state == "fetch"
+    assert ws.transfer_incoming_bytes == 1
+
+
+def test_worker_nbytes(ws_with_running_task):
+    ws = ws_with_running_task
+    ws2 = "127.0.0.1:2"
+    assert ws.nbytes == 0
+
+    # executing->memory
+    ws.handle_stimulus(ExecuteSuccessEvent.dummy("x", nbytes=12, stimulus_id="s1"))
+    assert ws.nbytes == 12
+
+    # flight->memory
+    ws.handle_stimulus(
+        AcquireReplicasEvent(who_has={"y": [ws2]}, nbytes={"y": 13}, stimulus_id="s2")
+    )
+    assert ws.nbytes == 12
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2,
+            data={"y": "foo"},
+            total_nbytes=13,
+            stimulus_id="s3",
+        )
+    )
+    assert ws.nbytes == 12 + 13
+
+    # released -> memory (scatter)
+    ws.handle_stimulus(
+        UpdateDataEvent(data={"z": "bar"}, report=False, stimulus_id="s3")
+    )
+    assert ws.nbytes == 12 + 13 + sizeof("bar")
+
+    # actors
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy("w", actor=True, stimulus_id="s4"),
+        ExecuteSuccessEvent.dummy("w", nbytes=14, stimulus_id="s5"),
+    )
+    assert ws.nbytes == 12 + 13 + sizeof("bar") + 14
+
+    # memory -> released by FreeKeysEvent
+    ws.handle_stimulus(FreeKeysEvent(keys=["z"], stimulus_id="s6"))
+    assert ws.nbytes == 12 + 13 + 14
+
+    # memory -> released by RemoveReplicasEvent
+    ws.handle_stimulus(RemoveReplicasEvent(keys=["x", "y", "w"], stimulus_id="s7"))
+    assert ws.nbytes == 0
