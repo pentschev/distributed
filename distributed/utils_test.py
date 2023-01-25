@@ -24,7 +24,7 @@ import threading
 import warnings
 import weakref
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import contextmanager, nullcontext, suppress
 from itertools import count
 from time import sleep
@@ -37,7 +37,6 @@ from tornado.httpclient import AsyncHTTPClient
 from tornado.ioloop import IOLoop
 
 import dask
-from dask.sizeof import sizeof
 
 from distributed import Event, Scheduler, system
 from distributed import versions as version_module
@@ -158,24 +157,6 @@ def loop_in_thread(cleanup):
                 # the loop failed to close and we need to raise the exception
                 ran.result()
                 return
-
-
-@contextmanager
-def pristine_loop():
-    IOLoop.clear_instance()
-    IOLoop.clear_current()
-    loop = IOLoop()
-    loop.make_current()
-    assert IOLoop.current() is loop
-    try:
-        yield loop
-    finally:
-        try:
-            loop.close(all_fds=True)
-        except (KeyError, ValueError):
-            pass
-        IOLoop.clear_instance()
-        IOLoop.clear_current()
 
 
 original_config = copy.deepcopy(dask.config.config)
@@ -1252,9 +1233,7 @@ def popen(
     if sys.platform.startswith("win"):
         args[0] = os.path.join(sys.prefix, "Scripts", args[0])
     else:
-        args[0] = os.path.join(
-            os.environ.get("DESTDIR", "") + sys.prefix, "bin", args[0]
-        )
+        args[0] = os.path.join(sys.prefix, "bin", args[0])
     with subprocess.Popen(args, **kwargs) as proc:
         try:
             yield proc
@@ -1593,7 +1572,7 @@ def bump_rlimit(limit, desired):
     try:
         soft, hard = resource.getrlimit(limit)
         if soft < desired:
-            resource.setrlimit(limit, (desired, max(hard, desired)))
+            resource.setrlimit(limit, (desired, min(hard, desired)))
     except Exception as e:
         pytest.skip(f"rlimit too low ({soft}) and can't be increased: {e}")
 
@@ -1646,9 +1625,7 @@ def check_thread_leak():
 
             frames = sys._current_frames()
             try:
-                lines: list[str] = [
-                    f"{len(bad_threads)} thread(s) were leaked from test\n"
-                ]
+                lines = [f"{len(bad_threads)} thread(s) were leaked from test\n"]
                 for i, thread in enumerate(bad_threads, 1):
                     lines.append(
                         f"------ Call stack of leaked thread {i}/{len(bad_threads)}: {thread} ------"
@@ -2148,6 +2125,23 @@ def ucx_loop():
     ucp.reset()
     loop.close()
 
+    # Reset also Distributed's UCX initialization, i.e., revert the effects of
+    # `distributed.comm.ucx.init_once()`.
+    import distributed.comm.ucx
+
+    distributed.comm.ucx.ucp = None
+    # If the test created a context, clean it up.
+    # TODO: should we check if there's already a context _before_ the test runs?
+    # I think that would be useful.
+    from distributed.diagnostics.nvml import has_cuda_context
+
+    ctx = has_cuda_context()
+    if ctx.has_context:
+        import numba.cuda
+
+        ctx = numba.cuda.current_context()
+        ctx.device.reset()
+
 
 def wait_for_log_line(
     match: bytes, stream: IO[bytes] | None, max_lines: int | None = 10
@@ -2353,10 +2347,14 @@ def freeze_batched_send(bcomm: BatchedSend) -> Iterator[LockedComm]:
 
 
 async def wait_for_state(
-    key: str, state: str, dask_worker: Worker | Scheduler, *, interval: float = 0.01
+    key: str,
+    state: str | Collection[str],
+    dask_worker: Worker | Scheduler,
+    *,
+    interval: float = 0.01,
 ) -> None:
     """Wait for a task to appear on a Worker or on the Scheduler and to be in a specific
-    state.
+    state or one of a set of possible states.
     """
     tasks: Mapping[str, SchedulerTaskState | WorkerTaskState]
 
@@ -2367,14 +2365,18 @@ async def wait_for_state(
     else:
         raise TypeError(dask_worker)  # pragma: nocover
 
+    if isinstance(state, str):
+        state = (state,)
+    state_str = repr(next(iter(state))) if len(state) == 1 else str(state)
+
     try:
-        while key not in tasks or tasks[key].state != state:
+        while key not in tasks or tasks[key].state not in state:
             await asyncio.sleep(interval)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         if key in tasks:
             msg = (
                 f"tasks[{key}].state={tasks[key].state!r} on {dask_worker.address}; "
-                f"expected {state=}"
+                f"expected state={state_str}"
             )
         else:
             msg = f"tasks[{key}] not found on {dask_worker.address}"
@@ -2473,19 +2475,54 @@ def requires_default_ports(name_of_test):
     yield
 
 
-async def fetch_metrics(port: int, prefix: str | None = None) -> dict[str, Any]:
-    from prometheus_client.parser import text_string_to_metric_families
-
+async def fetch_metrics_body(port: int) -> str:
     http_client = AsyncHTTPClient()
     response = await http_client.fetch(f"http://localhost:{port}/metrics")
     assert response.code == 200
-    txt = response.body.decode("utf8")
+    return response.body.decode("utf8")
+
+
+async def fetch_metrics(port: int, prefix: str | None = None) -> dict[str, Any]:
+    from prometheus_client.parser import text_string_to_metric_families
+
+    txt = await fetch_metrics_body(port)
     families = {
         family.name: family
         for family in text_string_to_metric_families(txt)
         if prefix is None or family.name.startswith(prefix)
     }
     return families
+
+
+async def fetch_metrics_sample_names(port: int, prefix: str | None = None) -> set[str]:
+    """
+    Get all the names of samples returned by Prometheus.
+
+    This mostly matches list of metric families, but when there's `foo` (gauge) and `foo_total` (count)
+    these will both have `foo` as the family.
+    """
+    from prometheus_client.parser import text_string_to_metric_families
+
+    txt = await fetch_metrics_body(port)
+    sample_names = set().union(
+        *[
+            {sample.name for sample in family.samples}
+            for family in text_string_to_metric_families(txt)
+            if prefix is None or family.name.startswith(prefix)
+        ]
+    )
+    return sample_names
+
+
+def _get_gc_overhead():
+    class _CustomObject:
+        def __sizeof__(self):
+            return 0
+
+    return sys.getsizeof(_CustomObject())
+
+
+_size_obj = _get_gc_overhead()
 
 
 class SizeOf:
@@ -2496,12 +2533,11 @@ class SizeOf:
     def __init__(self, nbytes: int) -> None:
         if not isinstance(nbytes, int):
             raise TypeError(f"Expected integer for nbytes but got {type(nbytes)}")
-        size_obj = sizeof(object())
-        if nbytes < size_obj:
+        if nbytes < _size_obj:
             raise ValueError(
-                f"Expected a value larger than {size_obj} integer but got {nbytes}."
+                f"Expected a value larger than {_size_obj} integer but got {nbytes}."
             )
-        self._nbytes = nbytes - size_obj
+        self._nbytes = nbytes - _size_obj
 
     def __sizeof__(self) -> int:
         return self._nbytes

@@ -10,11 +10,11 @@ from time import time
 from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, cast
 
 from tlz import topk
-from tornado.ioloop import PeriodicCallback
 
 import dask
 from dask.utils import parse_timedelta
 
+from distributed.compatibility import PeriodicCallback
 from distributed.core import CommClosedError
 from distributed.diagnostics.plugin import SchedulerPlugin
 from distributed.utils import log_errors, recursive_to_dict
@@ -78,6 +78,7 @@ class WorkStealing(SchedulerPlugin):
     # { worker state: occupancy }
     in_flight_occupancy: defaultdict[WorkerState, float]
     in_flight_tasks: defaultdict[WorkerState, int]
+    metrics: dict[str, dict[int, float]]
     _in_flight_event: asyncio.Event
     _request_counter: int
 
@@ -104,15 +105,19 @@ class WorkStealing(SchedulerPlugin):
         self.in_flight_occupancy = defaultdict(lambda: 0)
         self.in_flight_tasks = defaultdict(lambda: 0)
         self._in_flight_event = asyncio.Event()
+        self.metrics = {
+            "request_count_total": defaultdict(lambda: 0),
+            "request_cost_total": defaultdict(lambda: 0),
+        }
         self._request_counter = 0
         self.scheduler.stream_handlers["steal-response"] = self.move_task_confirm
 
     async def start(self, scheduler: Any = None) -> None:
         """Start the background coroutine to balance the tasks on the cluster.
         Idempotent.
-        The scheduler argument is ignored. It is merely required to satisify the
-        plugin interface. Since this class is simultaneouly an extension, the
-        scheudler instance is already registered during initialization
+        The scheduler argument is ignored. It is merely required to satisfy the
+        plugin interface. Since this class is simultaneously an extension, the
+        scheduler instance is already registered during initialization
         """
         if "stealing" in self.scheduler.periodic_callbacks:
             return
@@ -246,7 +251,7 @@ class WorkStealing(SchedulerPlugin):
         compute_time = self.scheduler.get_task_duration(ts)
 
         if not compute_time:
-            # occupancy/ws.proccessing[ts] is only allowed to be zero for
+            # occupancy/ws.processing[ts] is only allowed to be zero for
             # long running tasks which cannot be stolen
             assert ts.processing_on
             assert ts in ts.processing_on.long_running
@@ -287,7 +292,7 @@ class WorkStealing(SchedulerPlugin):
                 thief.occupancy,
             )
 
-            # TODO: occupancy no longer concats linearily so we can't easily
+            # TODO: occupancy no longer concats linearly so we can't easily
             # assume that the network cost would go down by that much
             victim_duration = self.scheduler.get_task_duration(
                 ts
@@ -360,7 +365,7 @@ class WorkStealing(SchedulerPlugin):
                         *_log_msg,
                     )
                 )
-                self.scheduler.reschedule(key, stimulus_id=stimulus_id)
+                self.scheduler._reschedule(key, stimulus_id=stimulus_id)
             # Victim had already started execution
             elif state in _WORKER_STATE_REJECT:
                 self.log(("already-computing", *_log_msg))
@@ -434,14 +439,13 @@ class WorkStealing(SchedulerPlugin):
                         if (
                             ts not in self.key_stealable
                             or ts.processing_on is not victim
+                            or ts not in victim.processing
                         ):
+                            # FIXME: Instead of discarding here, clean up stealable properly
                             stealable.discard(ts)
                             continue
                         i += 1
                         if not (thief := _get_thief(s, ts, potential_thieves)):
-                            continue
-                        if ts not in victim.processing:
-                            stealable.discard(ts)
                             continue
 
                         occ_thief = self._combined_occupancy(thief)
@@ -455,18 +459,21 @@ class WorkStealing(SchedulerPlugin):
                             <= occ_victim - (comm_cost_victim + compute) / 2
                         ):
                             self.move_task_request(ts, victim, thief)
+                            cost = compute + comm_cost_victim
                             log.append(
                                 (
                                     start,
                                     level,
                                     ts.key,
-                                    comm_cost_victim + compute,
+                                    cost,
                                     victim.address,
                                     occ_victim,
                                     thief.address,
                                     occ_thief,
                                 )
                             )
+                            self.metrics["request_count_total"][level] += 1
+                            self.metrics["request_cost_total"][level] += cost
 
                             occ_thief = self._combined_occupancy(thief)
                             nproc_thief = self._combined_nprocessing(thief)
@@ -475,6 +482,9 @@ class WorkStealing(SchedulerPlugin):
                                 thief, occ_thief, nproc_thief
                             ):
                                 potential_thieves.discard(thief)
+                            # FIXME: move_task_request already implements some logic
+                            # for removing ts from stealable. If we made sure to
+                            # properly clean up, we would not need this
                             stealable.discard(ts)
                     self.scheduler.check_idle_saturated(
                         victim, occ=self._combined_occupancy(victim)

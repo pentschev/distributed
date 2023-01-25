@@ -74,7 +74,7 @@ properties:
             - string
             - "null"
             description: |
-              Shut down the scheduler after this duration if no activity has occured
+              Shut down the scheduler after this duration if no activity has occurred
 
               This can be helpful to reduce costs and stop zombie processes from roaming the earth.
 
@@ -118,8 +118,13 @@ properties:
               How frequently to balance worker loads
 
           worker-saturation:
-            type: number
-            exclusiveMinimum: 0
+            oneOf:
+              - type: number
+                exclusiveMinimum: 0
+              # String "inf", not to be confused with .inf which in YAML means float
+              # infinity. This is necessary because there's no way to parse a float
+              # infinity from a DASK_* environment variable.
+              - enum: [inf]
             description: |
               Controls how many root tasks are sent to workers (like a `readahead`).
 
@@ -294,7 +299,7 @@ properties:
                   - process
                   - optimistic
                   - managed
-                  - managed_in_memory
+                  - managed_total
                 description:
                   One of the attributes of distributed.scheduler.MemoryState
               policies:
@@ -503,7 +508,7 @@ properties:
                       - process
                       - optimistic
                       - managed
-                      - managed_in_memory
+                      - managed_total
                     description: >-
                       Which of the properties of distributed.scheduler.MemoryState
                       should be used for measuring worker memory usage
@@ -536,7 +541,7 @@ properties:
 
               transfer:
                 oneOf:
-                  - {type: number, minimum: 0, maximum: 1}
+                  - {type: number, exclusiveMinimum: 0, maximum: 1}
                   - {enum: [false]}
                 description: >-
                   When the total size of incoming data transfers gets above this amount,
@@ -544,7 +549,7 @@ properties:
 
               target:
                 oneOf:
-                  - {type: number, minimum: 0, maximum: 1}
+                  - {type: number, exclusiveMinimum: 0, maximum: 1}
                   - {enum: [false]}
                 description: >-
                   When the process memory (as observed by the operating system) gets
@@ -553,7 +558,7 @@ properties:
 
               spill:
                 oneOf:
-                  - {type: number, minimum: 0, maximum: 1}
+                  - {type: number, exclusiveMinimum: 0, maximum: 1}
                   - {enum: [false]}
                 description: >-
                   When the process memory (as observed by the operating system) gets
@@ -563,7 +568,7 @@ properties:
 
               pause:
                 oneOf:
-                  - {type: number, minimum: 0, maximum: 1}
+                  - {type: number, exclusiveMinimum: 0, maximum: 1}
                   - {enum: [false]}
                 description: >-
                   When the process memory (as observed by the operating system) gets
@@ -572,7 +577,7 @@ properties:
 
               terminate:
                 oneOf:
-                  - {type: number, minimum: 0, maximum: 1}
+                  - {type: number, exclusiveMinimum: 0, maximum: 1}
                   - {enum: [false]}
                 description: >-
                   When the process memory reaches this level the nanny process will kill
@@ -965,7 +970,21 @@ properties:
                 type: [boolean, 'null']
                 description: |
                   Use UCXX's multi-buffer transfer API to reduce asyncio overhead.
+              environment:
+                type: object
+                description: |
+                  Mapping for setting arbitrary UCX environment variables.
+                  Names here are translated via the following rules to
+                  map to the relevant UCX environment variable:
+                    - hyphens are replaced with underscores
+                    - words are uppercased
+                    - UCX_ is prepended
+                  So, for example, setting ``some-option=value`` is
+                  equivalent to setting ``UCX_SOME_OPTION=value`` in
+                  the calling environment.
 
+                  For a full list of supported UCX environment
+                  variables, run ``ucx_info -f``.
           tcp:
             type: object
             properties:
@@ -984,7 +1003,7 @@ properties:
                   The maximum size of a websocket frame to send through a comm.
 
                   This is somewhat duplicative of distributed.comm.shard, but websockets
-                  often have much smaller maximum message sizes than othe protocols, so
+                  often have much smaller maximum message sizes than other protocols, so
                   this attribute is used to set a smaller default shard size and to
                   allow separate control of websocket message sharding.
 

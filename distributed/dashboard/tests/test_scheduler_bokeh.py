@@ -321,8 +321,8 @@ async def test_WorkersMemory(c, s, a, b):
     cl.update()
     d = dict(cl.source.data)
     llens = {len(l) for l in d.values()}
-    # There are 2 workers. There is definitely going to be managed_in_memory and
-    # unmanaged_old; there may be unmanaged_new. There won't be managed_spilled.
+    # There are 2 workers. There is definitely going to be managed and
+    # unmanaged_old; there may be unmanaged_new. There won't be spilled.
     # Empty rects are removed.
     assert llens in ({4}, {5}, {6})
     assert all(d["width"])
@@ -340,8 +340,8 @@ async def test_ClusterMemory(c, s, a, b):
     llens = {len(l) for l in d.values()}
     # Unlike WorkersMemory, empty rects here aren't pruned away.
     assert llens == {4}
-    # There is definitely going to be managed_in_memory and
-    # unmanaged_old; there may be unmanaged_new. There won't be managed_spilled.
+    # There is definitely going to be managed and
+    # unmanaged_old; there may be unmanaged_new. There won't be spilled.
     assert any(d["width"])
     assert not all(d["width"])
 
@@ -536,12 +536,10 @@ async def test_WorkerTable_custom_metric_overlap_with_core_metric(c, s, a, b):
     def metric(worker):
         return -999
 
-    a.metrics["executing"] = metric
     a.metrics["cpu"] = metric
     a.metrics["metric"] = metric
     await asyncio.gather(a.heartbeat(), b.heartbeat())
 
-    assert s.workers[a.address].metrics["executing"] != -999
     assert s.workers[a.address].metrics["cpu"] != -999
     assert s.workers[a.address].metrics["metric"] == -999
 
@@ -1114,7 +1112,7 @@ async def test_prefix_bokeh(s, a, b):
     assert bokeh_app.prefix == f"/{prefix}"
 
 
-@gen_cluster(client=True, worker_kwargs={"dashboard": True})
+@gen_cluster(client=True, scheduler_kwargs={"dashboard": True})
 async def test_shuffling(c, s, a, b):
     pytest.importorskip("pyarrow")
     dd = pytest.importorskip("dask.dataframe")
@@ -1122,7 +1120,6 @@ async def test_shuffling(c, s, a, b):
 
     df = dask.datasets.timeseries()
     df2 = dd.shuffle.shuffle(df, "x", shuffle="p2p").persist()
-
     start = time()
     while not ss.source.data["disk_read"]:
         ss.update()

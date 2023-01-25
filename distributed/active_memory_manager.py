@@ -12,11 +12,10 @@ from collections import defaultdict
 from collections.abc import Generator
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
-from tornado.ioloop import PeriodicCallback
-
 import dask
 from dask.utils import parse_timedelta
 
+from distributed.compatibility import PeriodicCallback
 from distributed.core import Status
 from distributed.metrics import time
 from distributed.utils import import_term, log_errors
@@ -96,9 +95,7 @@ class ActiveMemoryManagerExtension:
             )
         mem = scheduler.memory
         measure_domain = {
-            name
-            for name in dir(mem)
-            if not name.startswith("_") and isinstance(getattr(mem, name), int)
+            name for name in dir(mem) if not name.startswith("_") and name != "sum"
         }
         if not isinstance(measure, str) or measure not in measure_domain:
             raise ValueError(
@@ -430,8 +427,8 @@ if TYPE_CHECKING:
     # TODO import from typing (requires Python >=3.10)
     from typing_extensions import TypeAlias
 
-    # TODO remove quotes (requires Python >=3.9)
-    SuggestionGenerator: TypeAlias = Generator[Suggestion, "WorkerState | None", None]
+# TODO remove quotes (requires Python >=3.9)
+SuggestionGenerator: TypeAlias = "Generator[Suggestion, WorkerState | None, None]"
 
 
 class ActiveMemoryManagerPolicy(abc.ABC):

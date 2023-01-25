@@ -111,8 +111,8 @@ def set_tcp_timeout(comm):
             logger.debug("Setting TCP user timeout: %d ms", timeout * 1000)
             TCP_USER_TIMEOUT = 18  # since Linux 2.6.37
             sock.setsockopt(socket.SOL_TCP, TCP_USER_TIMEOUT, timeout * 1000)
-    except OSError as e:
-        logger.warning("Could not set timeout on TCP stream: %s", e)
+    except OSError:
+        logger.exception("Could not set timeout on TCP stream.")
 
 
 def get_stream_address(comm):
@@ -499,7 +499,7 @@ class BaseTCPConnector(Connector, RequireEncryptionMixin):
                     ip, port, max_buffer_size=MAX_BUFFER_SIZE, **kwargs
                 )
 
-            # Under certain circumstances tornado will have a closed connnection with an
+            # Under certain circumstances tornado will have a closed connection with an
             # error and not raise a StreamClosedError.
             #
             # This occurs with tornado 5.x and openssl 1.1+
