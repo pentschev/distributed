@@ -282,48 +282,50 @@ class UCX(Comm):
         )
         sizes = tuple(nbytes(f) for f in frames)
 
-        if multi_buffer is True:
-            if any(hasattr(f, "__cuda_array_interface__") for f in frames):
-                synchronize_stream(0)
-
-            close = [struct.pack("?", False)]
-            await self.ep.send_multi(close + frames)
-        else:
-            nframes = len(frames)
-            cuda_frames = tuple(hasattr(f, "__cuda_array_interface__") for f in frames)
-            cuda_send_frames, send_frames = zip(
-                *(
-                    (is_cuda, each_frame)
-                    for is_cuda, each_frame in zip(cuda_frames, frames)
-                    if nbytes(each_frame) > 0
-                )
-            )
-
         try:
-            # Send meta data
+            if multi_buffer is True:
+                if any(hasattr(f, "__cuda_array_interface__") for f in frames):
+                    synchronize_stream(0)
 
-            # Send close flag and number of frames (_Bool, int64)
-            await self.ep.send(struct.pack("?Q", False, nframes))
-            # Send which frames are CUDA (bool) and
-            # how large each frame is (uint64)
-            await self.ep.send(
-                struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
-            )
+                close = [struct.pack("?", False)]
+                await self.ep.send_multi(close + frames)
+            else:
+                nframes = len(frames)
+                cuda_frames = tuple(
+                    hasattr(f, "__cuda_array_interface__") for f in frames
+                )
+                cuda_send_frames, send_frames = zip(
+                    *(
+                        (is_cuda, each_frame)
+                        for is_cuda, each_frame in zip(cuda_frames, frames)
+                        if nbytes(each_frame) > 0
+                    )
+                )
 
-            # Send frames
+                # Send meta data
 
-            # It is necessary to first synchronize the default stream before start
-            # sending We synchronize the default stream because UCX is not
-            # stream-ordered and syncing the default stream will wait for other
-            # non-blocking CUDA streams. Note this is only sufficient if the memory
-            # being sent is not currently in use on non-blocking CUDA streams.
-            if any(cuda_send_frames):
-                synchronize_stream(0)
+                # Send close flag and number of frames (_Bool, int64)
+                await self.ep.send(struct.pack("?Q", False, nframes))
+                # Send which frames are CUDA (bool) and
+                # how large each frame is (uint64)
+                await self.ep.send(
+                    struct.pack(nframes * "?" + nframes * "Q", *cuda_frames, *sizes)
+                )
 
-            for each_frame in send_frames:
-                await self.ep.send(each_frame)
+                # Send frames
+
+                # It is necessary to first synchronize the default stream before start
+                # sending We synchronize the default stream because UCX is not
+                # stream-ordered and syncing the default stream will wait for other
+                # non-blocking CUDA streams. Note this is only sufficient if the memory
+                # being sent is not currently in use on non-blocking CUDA streams.
+                if any(cuda_send_frames):
+                    synchronize_stream(0)
+
+                for each_frame in send_frames:
+                    await self.ep.send(each_frame)
             return sum(sizes)
-        except (ucp.UCXBaseException):
+        except (ucp.exceptions.UCXError):
             self.abort()
             raise CommClosedError("While writing, the connection was closed")
 
@@ -430,10 +432,11 @@ class UCX(Comm):
                 else:
                     await self.ep.send(struct.pack("?Q", True, 0))
             except (
-                ucp.UCXError,
-                ucp.UCXCloseError,
-                ucp.UCXCanceled,
-            ) + (getattr(ucp, "UCXConnectionResetError", ()),):
+                ucp.exceptions.UCXError,
+                ucp.exceptions.UCXCloseError,
+                ucp.exceptions.UCXCanceledError,
+                ucp.exceptions.UCXConnectionResetError,
+            ):
                 # If the other end is in the process of closing,
                 # UCX will sometimes raise a `Input/output` error,
                 # which we can ignore.
@@ -477,11 +480,11 @@ class UCXConnector(Connector):
         init_once()
         try:
             ep = await ucp.create_endpoint(ip, port)
-        except (ucp.UCXCloseError, ucp.UCXCanceled,) + (
-            getattr(ucp, "UCXConnectionResetError", ()),
-            # getattr(ucp, "UCXNotConnected", ()),
-            # getattr(ucp, "UCXUnreachable", ()),
-        ):  # type: ignore
+        except (
+            ucp.exceptions.UCXCloseError,
+            ucp.exceptions.UCXCanceledError,
+            ucp.exceptions.UCXConnectionResetError,
+        ):
             raise CommClosedError("Connection closed before handshake completed")
         return self.comm_class(
             ep,
