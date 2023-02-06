@@ -533,7 +533,7 @@ class Cluster(SyncMethodMixin):
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        f = self.close()
+        f = self.close(timeout=1.0)
         if isawaitable(f):
             await f
 
