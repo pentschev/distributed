@@ -40,7 +40,7 @@ def _register_transports():
         )
 
     try:
-        from distributed.comm import ucx
+        import distributed_ucx
     except ImportError:
         pass
 
