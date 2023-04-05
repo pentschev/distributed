@@ -281,7 +281,6 @@ def test_schema_is_complete():
         "distributed.scheduler.dashboard.bokeh-application",
         "distributed.nanny.environ",
         "distributed.nanny.pre-spawn-environ",
-        "distributed.comm.ucx.environment",
     }
 
     def test_matches(c, s, root):

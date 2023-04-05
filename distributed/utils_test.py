@@ -2113,59 +2113,6 @@ def raises_with_cause(
         ), f"Pattern ``{match_cause}`` not found in ``{exc.__cause__}``"
 
 
-def ucx_exception_handler(loop, context):
-    """UCX exception handler for `ucx_loop` during test.
-
-    Prints the exception and its message.
-
-    Parameters
-    ----------
-    loop: object
-        Reference to the running event loop
-    context: dict
-        Dictionary containing exception details.
-    """
-    msg = context.get("exception", context["message"])
-    print(msg)
-
-
-# Let's make sure that UCX gets time to cancel
-# progress tasks before closing the event loop.
-@pytest.fixture(scope="function")
-def ucx_loop():
-    """Allows UCX to cancel progress tasks before closing event loop.
-
-    When UCX tasks are not completed in time (e.g., by unexpected Endpoint
-    closure), clean up tasks before closing the event loop to prevent unwanted
-    errors from being raised.
-    """
-    ucp = pytest.importorskip("ucp")
-
-    loop = asyncio.new_event_loop()
-    loop.set_exception_handler(ucx_exception_handler)
-    ucp.reset()
-    yield loop
-    ucp.reset()
-    loop.close()
-
-    # Reset also Distributed's UCX initialization, i.e., revert the effects of
-    # `distributed.comm.ucx.init_once()`.
-    import distributed.comm.ucx
-
-    distributed.comm.ucx.ucp = None
-    # If the test created a context, clean it up.
-    # TODO: should we check if there's already a context _before_ the test runs?
-    # I think that would be useful.
-    from distributed.diagnostics.nvml import has_cuda_context
-
-    ctx = has_cuda_context()
-    if ctx.has_context:
-        import numba.cuda
-
-        ctx = numba.cuda.current_context()
-        ctx.device.reset()
-
-
 def wait_for_log_line(
     match: bytes, stream: IO[bytes] | None, max_lines: int | None = 10
 ) -> bytes:

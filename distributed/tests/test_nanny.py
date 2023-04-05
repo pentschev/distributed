@@ -507,21 +507,6 @@ class KeyboardInterruptWorker(worker.Worker):
         self.loop.add_callback(raise_err)
 
 
-@pytest.mark.parametrize("protocol", ["tcp", "ucx"])
-@gen_test()
-async def test_nanny_closed_by_keyboard_interrupt(ucx_loop, protocol):
-    if protocol == "ucx":  # Skip if UCX isn't available
-        pytest.importorskip("ucp")
-
-    async with Scheduler(protocol=protocol, dashboard_address=":0") as s:
-        async with Nanny(
-            s.address, nthreads=1, worker_class=KeyboardInterruptWorker
-        ) as n:
-            await n.process.stopped.wait()
-            # Check that the scheduler has been notified about the closed worker
-            assert "remove-worker" in str(s.events)
-
-
 class BrokenWorker(worker.Worker):
     async def start_unsafe(self):
         raise ValueError("broken")
